@@ -1,0 +1,129 @@
+name: Build SecureNote
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags:     [ "v*" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:   # allow manual trigger from the Actions tab
+
+jobs:
+  build:
+    name: Build — ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Linux (x86-64, dynamically linked against system libs) ──────────
+          - name:    Linux x86-64
+            os:      ubuntu-22.04
+            target:  x86_64-unknown-linux-gnu
+            binary:  secure-note
+            archive: secure-note-linux-x86_64.tar.gz
+
+          # ── Windows (x86-64, fully static MSVC toolchain) ───────────────────
+          - name:    Windows x86-64
+            os:      windows-latest
+            target:  x86_64-pc-windows-msvc
+            binary:  secure-note.exe
+            archive: secure-note-windows-x86_64.zip
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Install Rust toolchain ────────────────────────────────────────────
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # ── 3. Cache Cargo registry + build artefacts ────────────────────────────
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # ── 4a. Linux — install egui / eframe system dependencies ────────────────
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libssl-dev \
+            libgtk-3-dev \
+            libglib2.0-dev \
+            pkg-config
+
+      # ── 5. Build release binary ───────────────────────────────────────────────
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # ── 6a. Linux — package as .tar.gz ───────────────────────────────────────
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/
+          cp README.md dist/
+          cd dist
+          tar -czf ../${{ matrix.archive }} .
+          cd ..
+
+      # ── 6b. Windows — package as .zip ────────────────────────────────────────
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\${{ matrix.binary }}" dist\
+          Copy-Item README.md dist\
+          Compress-Archive -Path dist\* -DestinationPath ${{ matrix.archive }}
+
+      # ── 7. Upload build artefact (every push/PR) ─────────────────────────────
+      - name: Upload build artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+          retention-days: 14
+
+  # ── Release job — only runs when a v* tag is pushed ──────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write   # needed to create the release and upload assets
+
+    steps:
+      - name: Download all build artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artefacts
+
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          name: SecureNote ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            artefacts/**/*.tar.gz
+            artefacts/**/*.zip
