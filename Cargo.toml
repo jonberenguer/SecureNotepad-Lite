@@ -1,0 +1,38 @@
+[package]
+name = "secure-note"
+version = "1.0.0"
+edition = "2021"
+description = "SecureNote — AES-256-GCM encrypted notepad, native egui desktop app"
+
+[[bin]]
+name = "secure-note"
+path = "src/main.rs"
+
+[dependencies]
+# Native GUI
+eframe = { version = "0.27", default-features = true }
+egui = "0.27"
+
+# Crypto (same as web version — notes.enc compatible)
+aes-gcm  = "0.10"
+pbkdf2   = { version = "0.12", features = ["hmac"] }
+sha2     = "0.10"
+hmac     = "0.12"
+rand     = "0.8"
+subtle   = "2"
+hex      = "0.4"
+base64   = "0.22"
+
+# Serialization
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level   = 3
+lto         = true
+codegen-units = 1
+strip       = true
+
