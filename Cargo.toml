@@ -9,8 +9,15 @@ name = "secure-note"
 path = "src/main.rs"
 
 [dependencies]
-# Native GUI
-eframe = { version = "0.27", default-features = true }
+# Native GUI — wgpu backend avoids the OpenGL 2.0 requirement on Windows.
+# Falls back to DX12 software rasterizer when no GPU is available.
+eframe = { version = "0.27", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "wgpu",       # use wgpu instead of glow — no OpenGL 2.0+ required
+    "wayland",    # Linux Wayland support
+    "x11",        # Linux X11 support
+] }
 egui = "0.27"
 
 # Crypto (same as web version — notes.enc compatible)
@@ -31,8 +38,8 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 
 [profile.release]
-opt-level   = 3
-lto         = true
+opt-level     = 3
+lto           = true
 codegen-units = 1
-strip       = true
+strip         = true
 

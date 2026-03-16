@@ -54,7 +54,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # ── 4a. Linux — install egui / eframe system dependencies ────────────────
+      # ── 4a. Linux — install egui / eframe / wgpu system dependencies ─────────
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
@@ -67,6 +67,7 @@ jobs:
             libssl-dev \
             libgtk-3-dev \
             libglib2.0-dev \
+            libvulkan-dev \
             pkg-config
 
       # ── 5. Build release binary ───────────────────────────────────────────────

@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::{fs, path::PathBuf, process};
 use subtle::ConstantTimeEq;
+use wgpu;
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -1388,6 +1389,15 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: vp,
+        renderer: eframe::Renderer::Wgpu,
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            // Allow wgpu to fall back to software rendering (e.g. DX12 WARP
+            // on Windows machines without a GPU or proper OpenGL drivers).
+            supported_backends: wgpu::Backends::all(),
+            power_preference: wgpu::util::power_preference_from_env()
+                .unwrap_or(wgpu::PowerPreference::None),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
