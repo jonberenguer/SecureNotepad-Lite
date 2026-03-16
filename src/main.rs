@@ -5,15 +5,12 @@
  * Encrypted note storage is wire-format compatible with the web (Rust/Node) version.
  *
  * Crypto wire format: base64( salt[32] || iv[12] || tag[16] || ciphertext )
- *
- * Features added:
- *   - Line numbers (toggle, aligned to wrapped text at any font/window size)
- *   - Tab close confirmation modal
- *   - Custom app icon via ./secure-notes/icon.png (optional)
- *   - Prefs panel closes + saves when clicking outside it
  */
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// NOTE: We do NOT set #![windows_subsystem = "windows"] here.
+// eframe sets it internally for release builds. Setting it ourselves
+// causes silent startup failures on Windows because panics and early
+// process::exit() calls produce no visible output whatsoever.
 
 use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Key, Nonce};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -1250,21 +1247,52 @@ impl SecureNote {
     }
 }
 
+// ─── Fatal error helper ───────────────────────────────────────────────────────
+//
+// On Windows release builds there is no console, so we show a message box
+// for any startup failure instead of silently exiting.
+
+fn fatal_error(msg: &str) -> ! {
+    #[cfg(target_os = "windows")]
+    {
+        // Use the Windows MessageBoxW API via a raw FFI call — no extra crate needed.
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+
+        let title: Vec<u16> = OsStr::new("SecureNote — Error")
+            .encode_wide().chain(std::iter::once(0)).collect();
+        let text: Vec<u16> = OsStr::new(msg)
+            .encode_wide().chain(std::iter::once(0)).collect();
+
+        #[link(name = "user32")]
+        extern "system" {
+            fn MessageBoxW(hwnd: *mut std::ffi::c_void,
+                           text: *const u16, caption: *const u16,
+                           utype: u32) -> i32;
+        }
+        unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), 0x10); }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    eprintln!("SecureNote error: {}", msg);
+
+    process::exit(1);
+}
+
 // ─── Single-instance lock ─────────────────────────────────────────────────────
 //
-// Strategy: write our PID to app.lock on startup.
-// On next launch, read the stored PID and check if that process is still alive.
-// Cross-platform: on Unix we probe /proc/<pid> or send signal 0;
-// on Windows we attempt to open the process handle.
-// If the check is uncertain we fall through and take the lock anyway.
+// Writes our PID to app.lock on startup.
+// On the next launch, reads the stored PID and checks if it is still alive.
+// Uses platform-native checks with no external crates.
 
 fn pid_is_running(pid: u32) -> bool {
+    if pid == 0 { return false; }
+
     #[cfg(target_os = "linux")]
     { std::path::Path::new(&format!("/proc/{}", pid)).exists() }
 
     #[cfg(target_os = "macos")]
     {
-        // On macOS use `kill -0` via std::process::Command
         std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
             .output()
@@ -1274,23 +1302,34 @@ fn pid_is_running(pid: u32) -> bool {
 
     #[cfg(target_os = "windows")]
     {
-        // tasklist /FI returns a table; if the PID appears, it is running
-        std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
-            .unwrap_or(false)
+        // OpenProcess with SYNCHRONIZE (0x00100000) — succeeds only if the
+        // process exists and we have permission to observe it.
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        }
+        const SYNCHRONIZE: u32 = 0x00100000;
+        unsafe {
+            let h = OpenProcess(SYNCHRONIZE, 0, pid);
+            if h.is_null() {
+                false
+            } else {
+                CloseHandle(h);
+                true
+            }
+        }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    { false } // unknown platform — assume not running, allow launch
+    { false }
 }
 
 fn acquire_lock(lock_path: &PathBuf) -> bool {
     if let Ok(contents) = fs::read_to_string(lock_path) {
         if let Ok(pid) = contents.trim().parse::<u32>() {
             if pid != process::id() && pid_is_running(pid) {
-                return false; // another instance is running
+                return false;
             }
         }
     }
@@ -1300,16 +1339,18 @@ fn acquire_lock(lock_path: &PathBuf) -> bool {
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 //
-// Custom icon: place a PNG file at  <data-dir>/icon.png  (e.g. ./secure-notes/icon.png)
-// and it will be used as the window / taskbar icon automatically.
-// If the file is absent the app falls back to the built-in 1×1 placeholder.
+// Custom icon: place icon.png in the data directory — loaded at runtime,
+// no recompile needed. Falls back to the built-in placeholder if absent.
 
 fn main() -> eframe::Result<()> {
     let cli = Cli::parse();
-    fs::create_dir_all(&cli.data).expect("Failed to create data directory");
 
-    let data_abs   = cli.data.canonicalize().unwrap_or(cli.data.clone());
-    let data_str   = data_abs.display().to_string();
+    if let Err(e) = fs::create_dir_all(&cli.data) {
+        fatal_error(&format!("Could not create data directory {:?}: {}", cli.data, e));
+    }
+
+    let data_abs = cli.data.canonicalize().unwrap_or_else(|_| cli.data.clone());
+    let data_str = data_abs.display().to_string();
 
     let notes_file  = data_abs.join("notes.enc");
     let config_file = data_abs.join("config.json");
@@ -1317,22 +1358,21 @@ fn main() -> eframe::Result<()> {
     let icon_file   = data_abs.join("icon.png");
     let lock_file   = data_abs.join("app.lock");
 
-    // ── Single instance check ────────────────────────────────────────────────
+    // ── Single instance ───────────────────────────────────────────────────────
     if !acquire_lock(&lock_file) {
-        eprintln!("SecureNote is already running.");
-        process::exit(1);
+        fatal_error("SecureNote is already running.\n\nOnly one instance is allowed at a time.");
     }
 
-    // ── Load prefs for window geometry ───────────────────────────────────────
+    // ── Prefs (needed for window geometry before building options) ────────────
     let prefs = load_prefs(&prefs_file);
 
-    // ── Icon ─────────────────────────────────────────────────────────────────
+    // ── Icon ──────────────────────────────────────────────────────────────────
     let icon_data = fs::read(&icon_file)
         .ok()
-        .and_then(|bytes| eframe::icon_data::from_png_bytes(&bytes).ok())
+        .and_then(|b| eframe::icon_data::from_png_bytes(&b).ok())
         .unwrap_or_else(|| eframe::icon_data::from_png_bytes(ICON_PNG).unwrap_or_default());
 
-    // ── Window options — restore last position/size if available ─────────────
+    // ── Window geometry ───────────────────────────────────────────────────────
     let mut vp = egui::ViewportBuilder::default()
         .with_title("SecureNote")
         .with_min_inner_size([600.0, 400.0])
@@ -1341,11 +1381,10 @@ fn main() -> eframe::Result<()> {
     if let (Some(x), Some(y)) = (prefs.win_x, prefs.win_y) {
         vp = vp.with_position([x, y]);
     }
-    let (w, h) = (
+    vp = vp.with_inner_size([
         prefs.win_w.unwrap_or(900.0),
         prefs.win_h.unwrap_or(640.0),
-    );
-    vp = vp.with_inner_size([w, h]);
+    ]);
 
     let options = eframe::NativeOptions {
         viewport: vp,
