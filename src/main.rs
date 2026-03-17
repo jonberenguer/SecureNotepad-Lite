@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::{fs, path::PathBuf, process};
 use subtle::ConstantTimeEq;
+use eframe::wgpu;
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -1337,6 +1338,36 @@ fn acquire_lock(lock_path: &PathBuf) -> bool {
     true
 }
 
+// ─── wgpu configuration ───────────────────────────────────────────────────────
+//
+// On Windows we explicitly request the DX12 backend and allow wgpu to fall
+// back to the WARP software rasterizer when no physical GPU is available.
+// This makes the app work on CI runners and machines without GPU drivers.
+// On Linux and macOS the defaults are used (Vulkan / Metal).
+
+fn wgpu_config() -> eframe::egui_wgpu::WgpuConfiguration {
+    #[cfg(target_os = "windows")]
+    {
+        eframe::egui_wgpu::WgpuConfiguration {
+            supported_backends: wgpu::Backends::DX12,
+            device_descriptor: std::sync::Arc::new(|_adapter| {
+                wgpu::DeviceDescriptor {
+                    label: Some("secure-note"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::downlevel_defaults(),
+                }
+            }),
+            power_preference: wgpu::PowerPreference::None,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        eframe::egui_wgpu::WgpuConfiguration::default()
+    }
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 //
 // Custom icon: place icon.png in the data directory — loaded at runtime,
@@ -1389,6 +1420,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: vp,
         renderer: eframe::Renderer::Wgpu,
+        wgpu_options: wgpu_config(),
         ..Default::default()
     };
 

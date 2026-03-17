@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Native GUI — wgpu backend avoids the OpenGL 2.0 requirement on Windows.
-# Falls back to DX12 software rasterizer when no GPU is available.
+# wgpu is listed directly so we can configure the adapter request.
 eframe = { version = "0.27", default-features = false, features = [
     "accesskit",
     "default_fonts",
@@ -18,7 +18,8 @@ eframe = { version = "0.27", default-features = false, features = [
     "wayland",    # Linux Wayland support
     "x11",        # Linux X11 support
 ] }
-egui = "0.27"
+egui  = "0.27"
+wgpu  = "0.19"   # must match the version eframe 0.27 uses internally
 
 # Crypto (same as web version — notes.enc compatible)
 aes-gcm  = "0.10"
