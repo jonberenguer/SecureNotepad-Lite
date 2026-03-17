@@ -2,10 +2,7 @@ name: Build SecureNote
 
 on:
   push:
-    branches: [ "main", "master" ]
-    tags:     [ "v*" ]
-  pull_request:
-    branches: [ "main", "master" ]
+    tags: [ "v*" ]     # only run when a version tag is pushed, e.g. v1.0.0
   workflow_dispatch:   # allow manual trigger from the Actions tab
 
 jobs:
@@ -17,14 +14,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ── Linux (x86-64, dynamically linked against system libs) ──────────
+          # ── Linux (x86-64) ───────────────────────────────────────────────────
           - name:    Linux x86-64
             os:      ubuntu-22.04
             target:  x86_64-unknown-linux-gnu
             binary:  secure-note
             archive: secure-note-linux-x86_64.tar.gz
 
-          # ── Windows (x86-64, fully static MSVC toolchain) ───────────────────
+          # ── Windows (x86-64, MSVC) ───────────────────────────────────────────
           - name:    Windows x86-64
             os:      windows-latest
             target:  x86_64-pc-windows-msvc
@@ -36,7 +33,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Install Rust toolchain ────────────────────────────────────────────
+      # ── 2. Install Rust stable ───────────────────────────────────────────────
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -54,7 +51,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # ── 4a. Linux — install egui / eframe / wgpu system dependencies ─────────
+      # ── 4. Linux — install system dependencies ───────────────────────────────
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
@@ -81,9 +78,7 @@ jobs:
           mkdir -p dist
           cp target/${{ matrix.target }}/release/${{ matrix.binary }} dist/
           cp README.md dist/
-          cd dist
-          tar -czf ../${{ matrix.archive }} .
-          cd ..
+          cd dist && tar -czf ../${{ matrix.archive }} . && cd ..
 
       # ── 6b. Windows — package as .zip ────────────────────────────────────────
       - name: Package (Windows)
@@ -95,22 +90,21 @@ jobs:
           Copy-Item README.md dist\
           Compress-Archive -Path dist\* -DestinationPath ${{ matrix.archive }}
 
-      # ── 7. Upload build artefact (every push/PR) ─────────────────────────────
+      # ── 7. Upload artefact ───────────────────────────────────────────────────
       - name: Upload build artefact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.archive }}
           path: ${{ matrix.archive }}
-          retention-days: 14
+          retention-days: 30
 
-  # ── Release job — only runs when a v* tag is pushed ──────────────────────────
+  # ── Create GitHub Release with both binaries attached ────────────────────────
   release:
     name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
-      contents: write   # needed to create the release and upload assets
+      contents: write
 
     steps:
       - name: Download all build artefacts
@@ -128,3 +122,4 @@ jobs:
           files: |
             artefacts/**/*.tar.gz
             artefacts/**/*.zip
+
