@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::{fs, path::PathBuf, process};
 use subtle::ConstantTimeEq;
-use wgpu;
 
 // ─── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -504,7 +503,7 @@ impl SecureNote {
 // ─── UI ───────────────────────────────────────────────────────────────────────
 
 impl eframe::App for SecureNote {
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn on_exit(&mut self) {
         // Save unsaved notes silently
         if self.dirty && !self.session_password.is_empty() {
             let _ = save_tabs(&self.notes_file, &self.session_password, &self.tabs);
@@ -1390,14 +1389,6 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: vp,
         renderer: eframe::Renderer::Wgpu,
-        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
-            // Allow wgpu to fall back to software rendering (e.g. DX12 WARP
-            // on Windows machines without a GPU or proper OpenGL drivers).
-            supported_backends: wgpu::Backends::all(),
-            power_preference: wgpu::util::power_preference_from_env()
-                .unwrap_or(wgpu::PowerPreference::None),
-            ..Default::default()
-        },
         ..Default::default()
     };
 
