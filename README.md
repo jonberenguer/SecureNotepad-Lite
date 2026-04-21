@@ -230,6 +230,55 @@ Place any PNG file named `icon.png` in the data directory (e.g. `./secure-notes/
 
 ---
 
+## Linux Desktop Integration (GNOME / KDE)
+
+The binary includes a built-in icon that shows in the window title bar and Alt+Tab switcher. To make the icon appear in the GNOME dock, Activities overview, or KDE application launcher you need a `.desktop` file and an icon in the right system location — GNOME Shell reads those instead of the window's embedded icon.
+
+### One-time setup
+
+```bash
+# 1. Copy the binary somewhere permanent
+sudo cp ./secure-note /usr/local/bin/secure-note
+
+# 2. Extract the built-in icon (requires ImageMagick or any PNG-capable tool)
+#    Alternatively copy your own 256×256 PNG.
+cp /path/to/your/icon.png ~/.local/share/icons/hicolor/256x256/apps/secure-note.png
+
+# 3. Refresh the icon cache (GNOME / GTK)
+gtk-update-icon-cache ~/.local/share/icons/hicolor/ 2>/dev/null || true
+
+# 4. Install the .desktop file
+mkdir -p ~/.local/share/applications
+cat > ~/.local/share/applications/secure-note.desktop << 'EOF'
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=SecureNote
+Comment=AES-256-GCM encrypted notepad
+Exec=/usr/local/bin/secure-note --data %h/.local/share/secure-notes
+Icon=secure-note
+Terminal=false
+Categories=Utility;Security;
+Keywords=note;encrypt;password;secure;
+StartupNotify=true
+StartupWMClass=secure-note
+EOF
+
+# 5. Reload the application database
+update-desktop-database ~/.local/share/applications 2>/dev/null || true
+```
+
+After step 5, SecureNote will appear in the GNOME Activities search and app grid with the correct icon.
+
+### Notes
+
+- Replace `/usr/local/bin/secure-note` with wherever you placed the binary, and update the `Exec=` line to match.
+- The `--data` flag in `Exec=` sets a per-user data directory. `%h` expands to the home directory. Omit it to use the default `./secure-notes/` relative to wherever the binary is launched from.
+- If you want a system-wide install (all users), copy the `.desktop` file to `/usr/share/applications/` and the icon to `/usr/share/icons/hicolor/256x256/apps/`, then run `sudo gtk-update-icon-cache /usr/share/icons/hicolor/`.
+- `StartupWMClass=secure-note` tells GNOME Shell to group the running window with this launcher entry, so the dock icon stays pinned correctly.
+
+---
+
 ## Single Instance
 
 On launch, SecureNote uses an atomic exclusive file creation (`O_CREAT | O_EXCL`) to write its PID to `app.lock` in the data directory. If another instance is already running, the new launch prints an error and exits immediately. The lock file is removed automatically on clean exit.
