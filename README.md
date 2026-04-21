@@ -314,6 +314,7 @@ This format is identical to the original Node.js web version, so `notes.enc` fil
 | **Windows** | DirectX 12 (WARP software fallback for machines without GPU drivers) |
 
 The console window is suppressed on Windows release builds via eframe's internal subsystem configuration.
+Windows will need [Microsoft Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) installed before running.
 
 ---
 
