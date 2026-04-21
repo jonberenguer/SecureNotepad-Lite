@@ -1,0 +1,8 @@
+# Rust build artifacts
+/target/
+
+# Compiled output
+/build/
+
+# Notes data produced when running locally
+/secure-notes/

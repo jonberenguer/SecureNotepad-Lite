@@ -15,8 +15,6 @@ eframe = { version = "0.27", default-features = false, features = [
     "accesskit",
     "default_fonts",
     "wgpu",       # use wgpu instead of glow — no OpenGL 2.0+ required
-    "wayland",    # Linux Wayland support
-    "x11",        # Linux X11 support
 ] }
 egui  = "0.27"
 wgpu  = "0.19"   # must match the version eframe 0.27 uses internally
@@ -37,6 +35,20 @@ serde_json = "1"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+
+# Native file dialogs (export / import)
+rfd = "0.14"
+
+# Zeroise sensitive memory on lock/exit
+zeroize = { version = "1", features = ["alloc"] }
+
+# Wayland and X11 support — Linux only; these features pull in native libs
+# that don't exist on Windows/macOS and would break cross-platform builds.
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.27", default-features = false, features = [
+    "wayland",
+    "x11",
+] }
 
 [profile.release]
 opt-level     = 3

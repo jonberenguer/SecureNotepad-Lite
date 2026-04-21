@@ -10,6 +10,14 @@
 
 # SecureNote
 
+**Your "temporary" notes aren't temporary.**
+
+Every time you drop an API key into Notepad, a VS Code scratch file, or a JetBrains editor tab, your IDE writes it to a crash-recovery file or local history buffer — in plaintext, in a location you'll never check.
+
+SecureNote is the secure placeholder developers actually need: a native, AES-256-encrypted notepad for tokens, credentials, and API keys in transit — while you're wiring them into your vault or password manager. Auto-lock on idle, clipboard auto-clear, zero plaintext on disk.
+
+---
+
 A cross-platform native desktop notepad with AES-256-GCM encryption. No web browser, no Node.js, no server — just a single compiled binary.
 
 ---
@@ -21,20 +29,39 @@ A cross-platform native desktop notepad with AES-256-GCM encryption. No web brow
 | 🔐 | **AES-256-GCM** encryption with **PBKDF2-SHA256** key derivation (310,000 iterations) |
 | 📑 | Up to **5 named encrypted tabs** |
 | 💾 | **Auto-save** with configurable delay; always saves on window close |
-| 🔍 | **Find & Replace** with match counter |
+| 💥 | **Crash-safe saves** — writes to a temp file and renames atomically, so a crash mid-write never corrupts `notes.enc` |
+| 🔍 | **Find & Replace** with match counter and prev/next navigation |
+| 🔁 | **Undo / Redo** (`Ctrl+Z` / `Ctrl+Y`) — per-tab snapshot history, preserved across tab switches |
+| 🔒 | **Per-tab locking** — lock individual tabs behind the master password for screen-sharing safety |
+| ⏱️ | **Auto-lock on idle** — configurable inactivity timeout that saves and locks automatically |
+| 📋 | **Clipboard auto-clear** — copied text is overwritten after a configurable delay (default 30 s) |
+| 🗂️ | **Export** current tab as `.txt` (toolbar or `Ctrl+E`) |
+| 📥 | **Import** a `.txt` file as a new tab (toolbar or `Ctrl+I`) |
 | 🎨 | **Dark / Light** theme toggle |
-| 🖱️ | **Ln / Col** cursor position in status bar |
+| 🖱️ | **Ln / Col** cursor position in status bar (Unicode-aware) |
 | 📁 | **Data directory path** shown in status bar |
-| ⚙️ | **Preferences** panel — font size, auto-save delay, theme (persisted to `prefs.json`) |
+| ⚙️ | **Preferences** panel — font size, auto-save delay, auto-lock delay, clipboard-clear delay, theme |
 | 🪟 | **Window position and size** restored on next launch |
+| 🛡️ | Constant-time password comparison, memory-zeroed on lock/exit, change password with rollback-safe re-encryption |
 | 🔒 | **Single instance** enforcement via PID lock file |
 | 🖼️ | **Custom app icon** — drop `icon.png` in the data directory, no recompile needed |
-| 🛡️ | Constant-time password comparison, change password with re-encryption, erase-all |
+| 🗂️ | **`--file` flag** — open a specific `.enc` file directly, bypassing the default data directory |
 | 🔗 | **Wire-format compatible** — `notes.enc` files are interchangeable with the web version |
 
 ---
 
 ## Building
+
+### Pre-built binaries (GitHub Actions)
+
+Every `v*` tag triggers a CI build that produces ready-to-run binaries attached to the [GitHub Release](../../releases):
+
+| File | Platform |
+|---|---|
+| `secure-note-linux-x86_64.tar.gz` | Linux x86-64 |
+| `secure-note-windows-x86_64.zip` | Windows x86-64 |
+
+### With Rust installed
 
 Install Rust if you haven't already:
 
@@ -48,12 +75,37 @@ Then build:
 cargo build --release
 ```
 
-The binary will be at:
+The binary will be at `target/release/secure-note` (Linux / macOS) or `target/release/secure-note.exe` (Windows).
 
-- **Linux / macOS:** `target/release/secure-note`
-- **Windows:** `target/release/secure-note.exe`
+### With Docker (recommended — no local Rust required)
 
-No additional runtime dependencies are required. egui uses the platform's native GPU backend (OpenGL on Linux/Windows, Metal on macOS).
+Run the included build script, which uses the `Dockerfile` to compile inside a container and copies the finished binary to `./build/`:
+
+```bash
+./build.sh
+```
+
+The binary will be at `./build/secure-note` when done.
+
+The script uses Docker BuildKit's `--output` flag to extract the binary from a scratch export stage — no intermediate containers are left behind and nothing outside `./build/` is written to the host.
+
+> **First run** downloads the `rust:latest` image and compiles all dependencies (~5–10 min). Subsequent runs reuse the Docker layer cache and are much faster when only source files change.
+
+#### Manual Docker commands (no script)
+
+If you prefer to run the steps yourself:
+
+```bash
+# Build the image and extract the binary to ./build/
+mkdir -p build
+DOCKER_BUILDKIT=1 docker build --target export --output type=local,dest=./build .
+
+# Or use docker cp if BuildKit output is unavailable
+docker build -t secure-note .
+docker create --name sn-tmp secure-note
+docker cp sn-tmp:/app/secure-note ./build/secure-note
+docker rm sn-tmp
+```
 
 ---
 
@@ -65,6 +117,9 @@ No additional runtime dependencies are required. egui uses the platform's native
 
 # Custom data directory
 ./secure-note --data /path/to/my/notes
+
+# Open a specific .enc file directly
+./secure-note --file /path/to/notes.enc
 ```
 
 The browser **does not open** — this is a native desktop window. On first launch you will be prompted to set a master password. **This password cannot be recovered.**
@@ -76,8 +131,9 @@ The browser **does not open** — this is a native desktop window. On first laun
 ```
 secure-notes/
 ├── notes.enc       ← AES-256-GCM encrypted tab contents (base64)
+├── notes.tmp       ← Transient temp file during a save (auto-deleted)
 ├── config.json     ← PBKDF2 password hash  (salt:hex_hash)
-├── prefs.json      ← UI preferences (font size, theme, window geometry, auto-save)
+├── prefs.json      ← UI preferences (font size, theme, window geometry, auto-save, auto-lock)
 ├── app.lock        ← PID lock file (single-instance enforcement, auto-removed on exit)
 └── icon.png        ← Optional custom app icon (PNG, any size)
 ```
@@ -90,12 +146,81 @@ secure-notes/
 |---|---|
 | `Ctrl+S` | Save all tabs |
 | `Ctrl+L` | Save and lock (return to password screen) |
+| `Ctrl+Z` | Undo (snapshot-based, per-tab) |
+| `Ctrl+Y` | Redo |
 | `Ctrl+F` | Open Find bar |
 | `Ctrl+H` | Open Find & Replace bar |
 | `Ctrl+T` | New tab |
+| `Ctrl+E` | Export current tab as `.txt` |
+| `Ctrl+I` | Import a `.txt` file as new tab |
 | `Ctrl+1` … `Ctrl+5` | Switch to tab 1–5 |
 | `Ctrl+,` | Toggle Preferences panel |
 | `Escape` | Close Find bar / close Preferences panel |
+
+---
+
+## Per-Tab Locking
+
+Individual tabs can be locked behind the master password without locking the entire session. Useful when sharing your screen or stepping away briefly.
+
+- Click the **🔒** icon in the tab bar to lock a tab instantly (no password needed — you're already authenticated).
+- Click **🔓** or click into the tab to unlock it — requires entering the master password.
+- The locked/unlocked state is persisted to `notes.enc`, so tabs that were locked before exiting remain locked on next launch.
+
+> **Note:** Per-tab locking is a screen-privacy feature. It does not add a separate encryption layer — all tabs share the same master key.
+
+---
+
+## Export & Import
+
+**Export** writes the current tab's content as a plain `.txt` file using a native save dialog.
+
+**Import** reads a `.txt` file from disk and creates a new tab with its content. The tab name is taken from the filename (without extension).
+
+Both operations respect the 5-tab limit and skip locked tabs on export.
+
+---
+
+## Undo / Redo
+
+SecureNote maintains an independent undo history per tab (up to 50 snapshots). Snapshots are taken automatically after 1.5 seconds of typing inactivity and at every manual save point.
+
+- `Ctrl+Z` — restore the previous snapshot
+- `Ctrl+Y` — move forward in history (redo)
+
+Undo history is cleared when the app locks (session ends) — all snapshots are individually zeroed in memory before the stacks are freed. It is not persisted to disk.
+
+---
+
+## Security Features
+
+### Auto-Lock on Idle
+Enable in Preferences → **AUTO-LOCK**. The app saves and returns to the password screen after the configured number of idle minutes. Any key press or pointer event resets the timer.
+
+### Clipboard Auto-Clear
+Enable in Preferences → **CLIPBOARD**. Any text you copy from SecureNote will be overwritten in the clipboard after the configured delay (default 30 seconds). This prevents sensitive content from remaining in your clipboard indefinitely.
+
+> **Note:** Clipboard clearing writes a space character to the OS clipboard via eframe's internal clipboard mechanism, which overwrites whatever SecureNote last copied. Content copied from other applications is not affected — the timer only starts when *you* copy from SecureNote.
+
+### Memory Zeroing
+When the session is locked (manually or via auto-lock), all sensitive data is securely overwritten in memory before being freed:
+
+- **Master password** — stored in a `Zeroizing<String>` wrapper; heap bytes are overwritten automatically on drop and explicitly on lock
+- **Tab contents** — each tab's plaintext is zeroed before the buffer is freed
+- **Undo history** — all per-tab snapshots are individually zeroed before the undo stacks are cleared
+- **Password input fields** — all password entry and change-password fields use `Zeroizing<String>`; intermediate copies created during validation are also zeroed on drop
+- **Crypto key material** — the 32-byte derived key is zeroed immediately after the AES-256-GCM cipher is initialized; PBKDF2 output buffers are zeroed after use
+
+This reduces exposure in memory dumps, core files, and swap.
+
+### File Permissions
+On Unix (Linux / macOS), `notes.enc` and `config.json` are created with `0600` permissions (owner read/write only), preventing other users on the same machine from reading the encrypted vault or password hash.
+
+### Restrictive Crypto Error Handling
+Key derivation (`derive_key`), encryption, and password hashing all return `Result` and propagate errors gracefully — no panics on crypto paths that could leave sensitive data in scope during an unwind.
+
+### Atomic Password Change
+Changing the master password re-encrypts `notes.enc` with the new key and writes the new hash to `config.json`. If the config write fails for any reason, the original encrypted file is automatically restored so the old password remains valid — preventing a state where the file is encrypted with one key but the stored hash is for another. The backup buffer holding the original ciphertext is wrapped in `Zeroizing<Vec<u8>>` and overwritten when freed.
 
 ---
 
@@ -107,9 +232,9 @@ Place any PNG file named `icon.png` in the data directory (e.g. `./secure-notes/
 
 ## Single Instance
 
-On launch, SecureNote writes its PID to `app.lock` in the data directory. If another instance is already running, the new launch prints an error and exits immediately. The lock file is removed automatically on clean exit.
+On launch, SecureNote uses an atomic exclusive file creation (`O_CREAT | O_EXCL`) to write its PID to `app.lock` in the data directory. If another instance is already running, the new launch prints an error and exits immediately. The lock file is removed automatically on clean exit.
 
-If the app crashes and leaves a stale lock file, simply delete `app.lock` manually before relaunching.
+If the app crashes and leaves a stale lock file, the next launch detects that the recorded PID is no longer running and automatically reclaims the lock — no manual deletion needed.
 
 ---
 
@@ -124,8 +249,8 @@ base64( salt[32 bytes] || iv[12 bytes] || auth_tag[16 bytes] || ciphertext )
 - **Key derivation:** PBKDF2-SHA256, 310,000 iterations
 - **Cipher:** AES-256-GCM (authenticated encryption — any tampering is detected)
 - **Password storage:** PBKDF2-SHA256 hash stored in `config.json` as `hex_salt:hex_hash`
-- **Password verification:** constant-time comparison (`subtle` crate) to prevent timing attacks
-- **Session:** in-memory only, no token written to disk
+- **Password verification:** constant-time comparison (`subtle` crate) to prevent timing attacks; stored hash length is hard-coded to 64 bytes to prevent truncation attacks
+- **Session:** in-memory only, no token written to disk; password, tab contents, undo history, and all derived key material are zeroed on lock
 
 This format is identical to the original Node.js web version, so `notes.enc` files are fully interchangeable between the two.
 
@@ -135,11 +260,11 @@ This format is identical to the original Node.js web version, so `notes.enc` fil
 
 | Platform | GPU Backend |
 |---|---|
-| **Linux** | OpenGL (X11 and Wayland) |
+| **Linux** | Vulkan primary; falls back to OpenGL/EGL on machines without Vulkan drivers (X11 and Wayland) |
 | **macOS** | Metal |
-| **Windows** | DirectX 12 / OpenGL fallback |
+| **Windows** | DirectX 12 (WARP software fallback for machines without GPU drivers) |
 
-The `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]` attribute suppresses the console window on Windows release builds.
+The console window is suppressed on Windows release builds via eframe's internal subsystem configuration.
 
 ---
 
@@ -153,7 +278,9 @@ The `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]` attribu
 | `sha2` / `hmac` | SHA-256 and HMAC for PBKDF2 |
 | `rand` | Cryptographically secure random bytes |
 | `subtle` | Constant-time byte comparison |
+| `zeroize` | Zero sensitive memory (passwords, tab contents) on lock |
+| `rfd` | Native file dialogs for export / import |
 | `hex` | Hex encoding/decoding |
 | `base64` | Base64 encoding/decoding |
 | `serde` / `serde_json` | JSON serialization for config and prefs |
-| `clap` | CLI argument parsing (`--data`, `--help`) |
+| `clap` | CLI argument parsing (`--data`, `--file`, `--help`) |
