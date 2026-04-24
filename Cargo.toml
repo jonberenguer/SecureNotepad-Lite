@@ -39,6 +39,9 @@ clap = { version = "4", features = ["derive"] }
 # Native file dialogs (export / import)
 rfd = "0.14"
 
+# Regex support for find/replace
+regex = "1"
+
 # Zeroise sensitive memory on lock/exit
 zeroize = { version = "1", features = ["alloc"] }
 

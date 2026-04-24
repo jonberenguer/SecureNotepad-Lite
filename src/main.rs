@@ -108,6 +108,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             let app = SecureNote::new(notes_file, config_file, prefs_file, lock_file, data_str);
+            app::setup_fonts(&cc.egui_ctx);
             app.apply_theme(&cc.egui_ctx);
             Box::new(app)
         }),

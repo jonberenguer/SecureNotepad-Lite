@@ -4,7 +4,7 @@ use crate::storage::{
     default_tabs, load_config, load_prefs, load_tabs,
     save_config, save_prefs, save_tabs,
 };
-use eframe::egui::{self, Color32, FontId, Key as EKey, Modifiers, RichText, Stroke, Vec2};
+use eframe::egui::{self, Color32, FontFamily, FontId, Key as EKey, Modifiers, RichText, Stroke, Vec2};
 use rfd::FileDialog;
 use std::{collections::HashMap, fs, path::PathBuf};
 use zeroize::{Zeroize, Zeroizing};
@@ -14,6 +14,46 @@ use zeroize::{Zeroize, Zeroizing};
 pub const MAX_TABS:      usize = 5;
 const MAX_UNDO:          usize = 50;
 const UNDO_INTERVAL:     f64   = 1.5;
+
+// ─── Material Icons font ──────────────────────────────────────────────────────
+
+static MATERIAL_ICONS: &[u8] = include_bytes!("../assets/MaterialIcons-Regular.ttf");
+
+// Codepoints from the Material Icons Regular font.
+const ICON_SAVE:      &str = "\u{e161}"; // save
+const ICON_EXPORT:    &str = "\u{e2c3}"; // file_upload
+const ICON_IMPORT:    &str = "\u{e2c4}"; // file_download
+const ICON_LOCK:      &str = "\u{e897}"; // lock
+const ICON_LOCK_OPEN: &str = "\u{e898}"; // lock_open
+const ICON_SEARCH:    &str = "\u{e8b6}"; // search
+const ICON_CLOSE:     &str = "\u{e5cd}"; // close
+const ICON_PREV:      &str = "\u{e5c7}"; // keyboard_arrow_up
+const ICON_NEXT:      &str = "\u{e5c5}"; // keyboard_arrow_down
+const ICON_ADD:       &str = "\u{e145}"; // add  (expand replace row)
+const ICON_REMOVE:    &str = "\u{e15b}"; // remove (collapse replace row)
+const ICON_CHEVRON_L: &str = "\u{e5c4}"; // arrow_back    (tab scroll left)
+const ICON_CHEVRON_R: &str = "\u{e5c8}"; // arrow_forward (tab scroll right)
+
+/// Load the Material Icons font into egui as a fallback for the Proportional
+/// family. Called once at startup from main.rs.
+pub fn setup_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "material_icons".to_owned(),
+        egui::FontData::from_static(MATERIAL_ICONS),
+    );
+    // Append as fallback so icon codepoints render from this font while normal
+    // text still uses the default Ubuntu-Light / Hack fonts.
+    fonts.families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .push("material_icons".to_owned());
+    fonts.families
+        .entry(FontFamily::Monospace)
+        .or_default()
+        .push("material_icons".to_owned());
+    ctx.set_fonts(fonts);
+}
 
 // ─── App state types ──────────────────────────────────────────────────────────
 
@@ -57,12 +97,15 @@ pub struct SecureNote {
     last_edit_time: f64,
 
     // Find / Replace
-    search_open:    bool,
-    search_query:   String,
-    replace_query:  String,
-    replace_mode:   bool,
-    search_results: Vec<(usize, usize)>,
-    search_idx:     usize,
+    search_open:        bool,
+    search_needs_focus: bool,
+    search_query:       String,
+    replace_query:      String,
+    replace_mode:       bool,
+    search_regex:       bool,
+    search_regex_error: bool,
+    search_results:     Vec<(usize, usize)>,
+    search_idx:         usize,
 
     // Cursor position (updated from TextEditOutput each frame)
     cursor_line: usize,
@@ -100,6 +143,10 @@ pub struct SecureNote {
     // Clipboard auto-clear
     clipboard_clear_at: Option<f64>,
 
+    // Tab bar scroll
+    tab_scroll_offset: f32,
+    tab_overflow:      bool,
+
     // Per-tab undo/redo history keyed by tab.id
     undo_stacks:      HashMap<u32, Vec<String>>,
     undo_positions:   HashMap<u32, usize>,
@@ -133,9 +180,12 @@ impl SecureNote {
             dirty:              false,
             last_edit_time:     0.0,
             search_open:        false,
+            search_needs_focus: false,
             search_query:       String::new(),
             replace_query:      String::new(),
             replace_mode:       false,
+            search_regex:       false,
+            search_regex_error: false,
             search_results:     vec![],
             search_idx:         0,
             cursor_line:        0,
@@ -156,6 +206,8 @@ impl SecureNote {
             toast_expire:       0.0,
             last_activity_time: 0.0,
             clipboard_clear_at:    None,
+            tab_scroll_offset:  0.0,
+            tab_overflow:       false,
             undo_stacks:        HashMap::new(),
             undo_positions:     HashMap::new(),
             undo_last_snap:     0.0,
@@ -208,8 +260,13 @@ impl SecureNote {
         self.tabs             = vec![];
         self.active_tab       = 0;
         self.dirty            = false;
-        self.search_open      = false;
-        self.prefs_open       = false;
+        self.search_open        = false;
+        self.search_needs_focus = false;
+        self.search_results.clear();
+        self.search_regex_error = false;
+        self.tab_scroll_offset  = 0.0;
+        self.tab_overflow       = false;
+        self.prefs_open         = false;
         self.modal            = Modal::None;
         self.cp_current.zeroize();
         self.cp_new.zeroize();
@@ -369,20 +426,35 @@ impl SecureNote {
 
     fn run_search(&mut self) {
         self.search_results.clear();
-        let q = self.search_query.to_lowercase();
-        if q.is_empty() { return; }
+        self.search_regex_error = false;
+        if self.search_query.is_empty() { return; }
         let content = self.tabs.get(self.active_tab)
-            .map(|t| t.content.to_lowercase())
-            .unwrap_or_default();
-        let qb = q.as_bytes();
-        let cb = content.as_bytes();
-        let mut i = 0;
-        while i + qb.len() <= cb.len() {
-            if cb[i..i + qb.len()] == *qb {
-                self.search_results.push((i, i + qb.len()));
-                i += qb.len();
-            } else {
-                i += 1;
+            .map(|t| t.content.as_str())
+            .unwrap_or("");
+        if self.search_regex {
+            match regex::Regex::new(&self.search_query) {
+                Ok(re) => {
+                    for m in re.find_iter(content) {
+                        if m.start() < m.end() {
+                            self.search_results.push((m.start(), m.end()));
+                        }
+                    }
+                }
+                Err(_) => { self.search_regex_error = true; return; }
+            }
+        } else {
+            let q  = self.search_query.to_lowercase();
+            let c  = content.to_lowercase();
+            let qb = q.as_bytes();
+            let cb = c.as_bytes();
+            let mut i = 0;
+            while i + qb.len() <= cb.len() {
+                if cb[i..i + qb.len()] == *qb {
+                    self.search_results.push((i, i + qb.len()));
+                    i += qb.len();
+                } else {
+                    i += 1;
+                }
             }
         }
         if self.search_idx >= self.search_results.len() {
@@ -390,13 +462,36 @@ impl SecureNote {
         }
     }
 
-    fn replace_all(&mut self) {
-        let q = self.search_query.clone();
+    fn replace_current(&mut self) {
+        let Some(&(start, end)) = self.search_results.get(self.search_idx) else { return };
         let r = self.replace_query.clone();
-        if q.is_empty() { return; }
         if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-            tab.content = tab.content.replace(&q, &r);
-            self.dirty  = true;
+            tab.content.replace_range(start..end, &r);
+            self.dirty = true;
+        }
+        self.run_search();
+    }
+
+    fn skip_match(&mut self) {
+        if !self.search_results.is_empty() {
+            self.search_idx = (self.search_idx + 1) % self.search_results.len();
+        }
+    }
+
+    fn replace_all(&mut self) {
+        if self.search_query.is_empty() { return; }
+        let r = self.replace_query.clone();
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            if self.search_regex {
+                if let Ok(re) = regex::Regex::new(&self.search_query) {
+                    tab.content = re.replace_all(&tab.content, r.as_str()).into_owned();
+                    self.dirty  = true;
+                }
+            } else {
+                let q = self.search_query.clone();
+                tab.content = tab.content.replace(&q, &r);
+                self.dirty  = true;
+            }
         }
         self.run_search();
     }
@@ -600,13 +695,17 @@ impl eframe::App for SecureNote {
         }
 
         // Auto-lock on idle.
-        if self.screen == Screen::Editor
-            && self.prefs.auto_lock
-            && self.last_activity_time > 0.0
-            && now - self.last_activity_time >= self.prefs.auto_lock_delay * 60.0
-        {
-            self.save_now(ctx);
-            self.lock();
+        if self.screen == Screen::Editor && self.prefs.auto_lock && self.last_activity_time > 0.0 {
+            let elapsed  = now - self.last_activity_time;
+            let timeout  = self.prefs.auto_lock_delay * 60.0;
+            if elapsed >= timeout {
+                self.save_now(ctx);
+                self.lock();
+            } else {
+                // Schedule a repaint at the exact moment the lock should fire so
+                // update() runs even when the window is minimized or otherwise idle.
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(timeout - elapsed));
+            }
         }
 
         match self.screen.clone() {
@@ -783,8 +882,12 @@ impl SecureNote {
             else { self.persist_prefs(); }
         }
 
-        if ctrl && ctx.input(|i| i.key_pressed(EKey::F)) { self.search_open = true; self.replace_mode = false; }
-        if ctrl && ctx.input(|i| i.key_pressed(EKey::H)) { self.search_open = true; self.replace_mode = true; }
+        if ctrl && ctx.input(|i| i.key_pressed(EKey::F)) {
+            self.search_open = true; self.replace_mode = false; self.search_needs_focus = true;
+        }
+        if ctrl && ctx.input(|i| i.key_pressed(EKey::H)) {
+            self.search_open = true; self.replace_mode = true; self.search_needs_focus = true;
+        }
         if ctrl && ctx.input(|i| i.key_pressed(EKey::T)) { if self.tabs.len() < MAX_TABS { self.add_tab(); } }
         if ctrl && ctx.input(|i| i.key_pressed(EKey::L)) { self.save_now(ctx); self.lock(); }
 
@@ -794,10 +897,12 @@ impl SecureNote {
         if ctrl && ctx.input(|i| i.key_pressed(EKey::E)) { self.do_export_tab(ctx); }
         if ctrl && ctx.input(|i| i.key_pressed(EKey::I)) { self.do_import_tab(ctx); }
 
-        if ctx.input(|i| i.key_pressed(EKey::Escape)) {
+        if (self.search_open || self.prefs_open)
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, EKey::Escape))
+        {
             if self.search_open {
                 self.search_open = false;
-            } else if self.prefs_open {
+            } else {
                 self.prefs_open = false;
                 self.persist_prefs();
             }
@@ -828,18 +933,18 @@ impl SecureNote {
                 .inner_margin(egui::Margin::symmetric(12.0, 0.0)))
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.label(RichText::new("▣ SNote").monospace().size(13.0).strong().color(accent));
+                    ui.label(RichText::new("SNote").monospace().size(13.0).strong().color(accent));
                     ui.separator();
 
-                    if ui.button(RichText::new("💾 Save").size(12.0))
+                    if ui.button(RichText::new(format!("{ICON_SAVE} Save")).size(12.0))
                         .on_hover_text("Save (Ctrl+S)").clicked()
                     { self.save_now(ctx); }
 
-                    if ui.button(RichText::new("↓ Export").size(12.0))
+                    if ui.button(RichText::new(format!("{ICON_EXPORT} Export")).size(12.0))
                         .on_hover_text("Export current tab as .txt (Ctrl+E)").clicked()
                     { self.do_export_tab(ctx); }
 
-                    if ui.button(RichText::new("↑ Import").size(12.0))
+                    if ui.button(RichText::new(format!("{ICON_IMPORT} Import")).size(12.0))
                         .on_hover_text("Import .txt file as new tab (Ctrl+I)").clicked()
                     { self.do_import_tab(ctx); }
 
@@ -857,20 +962,17 @@ impl SecureNote {
                     } else {
                         ("SAVED",   Color32::from_rgb(60, 180, 100), Color32::from_rgba_unmultiplied(60, 180, 100, 30))
                     };
-                    egui::Frame::none()
+                    ui.add(
+                        egui::Button::new(
+                            RichText::new(status_text).size(12.0).strong().monospace().color(status_color)
+                        )
                         .fill(status_bg)
-                        .rounding(4.0)
-                        .inner_margin(egui::Margin::symmetric(6.0, 2.0))
-                        .show(ui, |ui| {
-                            ui.label(RichText::new(status_text)
-                                .size(10.0).strong().monospace()
-                                .color(status_color));
-                        })
-                        .response
-                        .on_hover_text(if self.dirty { "Unsaved changes" } else { "All saved" });
+                        .min_size(Vec2::new(0.0, 28.0))
+                        .sense(egui::Sense::hover())
+                    ).on_hover_text(if self.dirty { "Unsaved changes" } else { "All saved" });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(RichText::new("🔒 Lock").size(12.0))
+                        if ui.button(RichText::new(format!("{ICON_LOCK} Lock")).size(12.0))
                             .on_hover_text("Save & lock (Ctrl+L)").clicked()
                         { self.save_now(ctx); self.lock(); }
 
@@ -883,9 +985,9 @@ impl SecureNote {
                             else { self.persist_prefs(); }
                         }
 
-                        if ui.button(RichText::new("🔍 Find").size(12.0))
+                        if ui.button(RichText::new(format!("{ICON_SEARCH} Find")).size(12.0))
                             .on_hover_text("Find / Replace (Ctrl+F / Ctrl+H)").clicked()
-                        { self.search_open = true; self.replace_mode = false; }
+                        { self.search_open = true; self.replace_mode = false; self.search_needs_focus = true; }
                     });
                 });
             });
@@ -896,6 +998,7 @@ impl SecureNote {
     fn ui_tabbar(&mut self, ctx: &egui::Context) {
         let accent       = Color32::from_rgb(124, 106, 247);
         let locked_color = Color32::from_rgb(200, 160, 60);
+        let dim          = Color32::from_rgb(80, 80, 100);
         let bg     = if self.prefs.dark_mode { Color32::from_rgb(22,22,26)  } else { Color32::from_rgb(228,228,223) };
         let border = if self.prefs.dark_mode { Color32::from_rgb(46,46,56)  } else { Color32::from_rgb(204,204,196) };
 
@@ -903,152 +1006,210 @@ impl SecureNote {
             .exact_height(36.0)
             .frame(egui::Frame::none().fill(bg).stroke(Stroke::new(1.0, border)))
             .show(ctx, |ui| {
+                const TAB_NAME_MAX: usize = 11;
+                const TAB_NAME_W:   f32   = 76.0;
+                const TAB_LOCK_W:   f32   = 22.0;
+                const TAB_CLOSE_W:  f32   = 18.0;
+                const ARROW_W:      f32   = 28.0;
+
+                let mut switch_to  = None;
+                let mut close_idx  = None;
+                let mut rename_idx = None;
+                let mut lock_idx   = None;
+
+                let snapshot: Vec<(usize, String, bool, bool)> = self.tabs.iter().enumerate()
+                    .map(|(i, t)| (i, t.name.clone(), i == self.active_tab, t.locked))
+                    .collect();
+
+                // Show arrows whenever there are 2+ tabs so layout is always stable.
+                let show_arrows = self.tabs.len() >= 2;
+
+                // Pre-compute the exact width we can give the scroll area so that the
+                // right arrow and + button always fit.  All measurements are approximate
+                // (item_spacing varies) but erring on the side of slightly smaller
+                // prevents the right-side buttons from being pushed off-screen.
+                let total_avail = ui.available_width();
+                let arrow_budget = if show_arrows { ARROW_W * 2.0 + 16.0 } else { 0.0 };
+                let right_budget = 60.0; // separator (~10) + + button (32) + spacing (~18)
+                let scroll_w = (total_avail - arrow_budget - right_budget).max(50.0);
+
+                let text_color = ui.visuals().text_color();
+
                 ui.horizontal(|ui| {
-                    ui.add_space(12.0);
-
-                    // Tab name is truncated to keep all tabs a consistent width.
-                    // Exception: names shorter than the limit display naturally.
-                    const TAB_NAME_MAX: usize = 11;
-                    const TAB_NAME_W:   f32   = 76.0;  // fixed name-button width
-                    const TAB_LOCK_W:   f32   = 22.0;  // always-visible lock icon
-                    const TAB_CLOSE_W:  f32   = 18.0;  // hover-only close button
-
-                    let mut switch_to  = None;
-                    let mut close_idx  = None;
-                    let mut rename_idx = None;
-                    let mut lock_idx   = None;
-
-                    let snapshot: Vec<(usize, String, bool, bool)> = self.tabs.iter().enumerate()
-                        .map(|(i, t)| (i, t.name.clone(), i == self.active_tab, t.locked))
-                        .collect();
-
-                    for (i, name, is_active, is_locked) in &snapshot {
-                        let i         = *i;
-                        let is_active = *is_active;
-                        let is_locked = *is_locked;
-
-                        // Inline rename input — no lock icon while renaming.
-                        if self.renaming_tab == Some(i) {
-                            let resp = ui.add(
-                                egui::TextEdit::singleline(&mut self.rename_buf)
-                                    .desired_width(TAB_NAME_W + TAB_LOCK_W)
-                                    .font(FontId::proportional(12.0))
-                            );
-                            let commit = resp.lost_focus()
-                                || ctx.input(|inp| inp.key_pressed(EKey::Enter));
-                            let cancel = ctx.input(|inp| inp.key_pressed(EKey::Escape));
-                            if commit {
-                                let v = self.rename_buf.trim().to_string();
-                                if !v.is_empty() {
-                                    self.tabs[i].name = v.chars().take(64).collect();
-                                    self.dirty = true;
-                                }
-                                self.renaming_tab = None;
-                            } else if cancel {
-                                self.renaming_tab = None;
-                            } else {
-                                resp.request_focus();
-                            }
-                            if i + 1 < self.tabs.len() { ui.separator(); }
-                            continue;
-                        }
-
-                        // Truncate name to keep tab width consistent.
-                        let truncated: String = if name.chars().count() > TAB_NAME_MAX {
-                            format!("{}…", name.chars().take(TAB_NAME_MAX - 1).collect::<String>())
-                        } else {
-                            name.clone()
-                        };
-
-                        // ── Lock icon (always visible) ────────────────────────
-                        let lock_icon  = if is_locked { "🔒" } else { "🔓" };
-                        let lock_color = if is_locked {
-                            locked_color
-                        } else {
-                            Color32::from_rgb(80, 80, 100)
-                        };
-                        let lock_btn = ui.add(
-                            egui::Button::new(RichText::new(lock_icon).size(11.0).color(lock_color))
+                    // ── Left scroll arrow ─────────────────────────────────────
+                    if show_arrows {
+                        let can_go = self.tab_scroll_offset > 0.0;
+                        let icon_color = if can_go { text_color } else { dim };
+                        let resp = ui.add(
+                            egui::Button::new(RichText::new(ICON_CHEVRON_L).size(16.0).color(icon_color))
                                 .frame(false)
-                                .min_size(Vec2::new(TAB_LOCK_W, 28.0))
-                        ).on_hover_text(if is_locked { "Click to unlock tab" } else { "Click to lock tab" });
-
-                        if lock_btn.clicked() {
-                            if is_locked {
-                                // Navigate to the tab; the inline overlay handles the password.
-                                switch_to = Some(i);
-                            } else {
-                                lock_idx = Some(i);
-                            }
+                                .min_size(Vec2::new(ARROW_W, 28.0))
+                        ).on_hover_text("Scroll tabs left");
+                        if resp.clicked() && can_go {
+                            self.tab_scroll_offset = (self.tab_scroll_offset - 130.0).max(0.0);
                         }
-
-                        // ── Tab name button (fixed width) ─────────────────────
-                        let mut text = RichText::new(&truncated).size(12.0);
-                        if is_active {
-                            text = text.color(if is_locked { locked_color } else { accent });
-                        } else if is_locked {
-                            text = text.color(Color32::from_rgb(160, 130, 50));
-                        }
-
-                        let tab_bg = if is_active && self.dirty && !is_locked {
-                            Some(Color32::from_rgba_unmultiplied(224, 140, 40, 18))
-                        } else {
-                            None
-                        };
-
-                        let resp = if let Some(fill) = tab_bg {
-                            egui::Frame::none()
-                                .fill(fill)
-                                .inner_margin(egui::Margin::symmetric(2.0, 0.0))
-                                .show(ui, |ui| {
-                                    ui.add(egui::Button::new(text).frame(false)
-                                        .min_size(Vec2::new(TAB_NAME_W, 28.0)))
-                                })
-                                .inner
-                        } else {
-                            ui.add(egui::Button::new(text).frame(false)
-                                .min_size(Vec2::new(TAB_NAME_W, 28.0)))
-                        };
-
-                        if resp.clicked()        { switch_to  = Some(i); }
-                        if resp.double_clicked() && !is_locked { rename_idx = Some(i); }
-
-                        // ── Close button (hover/active, unlocked only) ────────
-                        if !is_locked && (is_active || resp.hovered() || lock_btn.hovered()) {
-                            if ui.add(
-                                egui::Button::new(
-                                    RichText::new("×").size(13.0)
-                                        .color(Color32::from_rgb(136, 136, 160))
-                                ).frame(false).min_size(Vec2::new(TAB_CLOSE_W, 28.0))
-                            ).clicked() { close_idx = Some(i); }
-                        }
-
-                        if i + 1 < self.tabs.len() { ui.separator(); }
                     }
 
+                    // ── Scrollable tab strip ──────────────────────────────────
+                    let scroll_out = egui::ScrollArea::horizontal()
+                        .id_source("tabbar_scroll")
+                        .auto_shrink([false, false])
+                        .max_width(scroll_w)
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                        .scroll_offset(egui::Vec2::new(self.tab_scroll_offset, 0.0))
+                        .show(ui, |ui| {
+                            ui.set_min_width(scroll_w);
+                            ui.horizontal(|ui| {
+                                ui.add_space(12.0);
+
+                                for (i, name, is_active, is_locked) in &snapshot {
+                                    let i         = *i;
+                                    let is_active = *is_active;
+                                    let is_locked = *is_locked;
+
+                                    // Inline rename input
+                                    if self.renaming_tab == Some(i) {
+                                        let resp = ui.add(
+                                            egui::TextEdit::singleline(&mut self.rename_buf)
+                                                .desired_width(TAB_NAME_W + TAB_LOCK_W)
+                                                .font(FontId::proportional(12.0))
+                                        );
+                                        let commit = resp.lost_focus()
+                                            || ctx.input(|inp| inp.key_pressed(EKey::Enter));
+                                        let cancel = ctx.input(|inp| inp.key_pressed(EKey::Escape));
+                                        if commit {
+                                            let v = self.rename_buf.trim().to_string();
+                                            if !v.is_empty() {
+                                                self.tabs[i].name = v.chars().take(64).collect();
+                                                self.dirty = true;
+                                            }
+                                            self.renaming_tab = None;
+                                        } else if cancel {
+                                            self.renaming_tab = None;
+                                        } else {
+                                            resp.request_focus();
+                                        }
+                                        if i + 1 < self.tabs.len() { ui.separator(); }
+                                        continue;
+                                    }
+
+                                    let truncated: String = if name.chars().count() > TAB_NAME_MAX {
+                                        format!("{}…", name.chars().take(TAB_NAME_MAX - 1).collect::<String>())
+                                    } else {
+                                        name.clone()
+                                    };
+
+                                    // ── Lock icon ─────────────────────────────
+                                    let lock_icon  = if is_locked { ICON_LOCK } else { ICON_LOCK_OPEN };
+                                    let lock_color = if is_locked { locked_color } else { dim };
+                                    let lock_btn = ui.add(
+                                        egui::Button::new(RichText::new(lock_icon).size(11.0).color(lock_color))
+                                            .frame(false)
+                                            .min_size(Vec2::new(TAB_LOCK_W, 28.0))
+                                    ).on_hover_text(if is_locked { "Click to unlock tab" } else { "Click to lock tab" });
+                                    if lock_btn.clicked() {
+                                        if is_locked { switch_to = Some(i); } else { lock_idx = Some(i); }
+                                    }
+
+                                    // ── Tab name ──────────────────────────────
+                                    let mut text = RichText::new(&truncated).size(12.0);
+                                    if is_active {
+                                        text = text.color(if is_locked { locked_color } else { accent });
+                                    } else if is_locked {
+                                        text = text.color(Color32::from_rgb(160, 130, 50));
+                                    }
+                                    let tab_bg = if is_active && self.dirty && !is_locked {
+                                        Some(Color32::from_rgba_unmultiplied(224, 140, 40, 18))
+                                    } else {
+                                        None
+                                    };
+                                    let resp = if let Some(fill) = tab_bg {
+                                        egui::Frame::none()
+                                            .fill(fill)
+                                            .inner_margin(egui::Margin::symmetric(2.0, 0.0))
+                                            .show(ui, |ui| {
+                                                ui.add(egui::Button::new(text).frame(false)
+                                                    .min_size(Vec2::new(TAB_NAME_W, 28.0)))
+                                            }).inner
+                                    } else {
+                                        ui.add(egui::Button::new(text).frame(false)
+                                            .min_size(Vec2::new(TAB_NAME_W, 28.0)))
+                                    };
+                                    if resp.clicked()        { switch_to  = Some(i); }
+                                    if resp.double_clicked() && !is_locked { rename_idx = Some(i); }
+
+                                    // ── Close button ──────────────────────────
+                                    if !is_locked {
+                                        let hovered = resp.hovered() || lock_btn.hovered();
+                                        let close_color = if hovered || is_active {
+                                            Color32::from_rgb(136, 136, 160)
+                                        } else {
+                                            Color32::from_rgba_unmultiplied(136, 136, 160, 60)
+                                        };
+                                        if ui.add(
+                                            egui::Button::new(
+                                                RichText::new(ICON_CLOSE).size(14.0).color(close_color)
+                                            ).frame(false).min_size(Vec2::new(TAB_CLOSE_W, 28.0))
+                                        ).clicked() { close_idx = Some(i); }
+                                    }
+
+                                    if i + 1 < self.tabs.len() { ui.separator(); }
+                                }
+                            });
+                        });
+
+                    // Sync scroll state from this frame's output.
+                    self.tab_scroll_offset = scroll_out.state.offset.x;
+                    self.tab_overflow = scroll_out.content_size.x > scroll_out.inner_rect.width() + 1.0;
+
+                    let max_scroll = (scroll_out.content_size.x
+                        - scroll_out.inner_rect.width()).max(0.0);
+
+                    // Mouse wheel scrolls the tab strip (up → left, down → right).
+                    if ui.rect_contains_pointer(ui.max_rect()) {
+                        let delta = ctx.input(|i| i.smooth_scroll_delta.y);
+                        if delta != 0.0 {
+                            self.tab_scroll_offset =
+                                (self.tab_scroll_offset - delta).clamp(0.0, max_scroll);
+                        }
+                    }
+
+                    // ── Right scroll arrow ───────────────────────────────────
+                    if show_arrows {
+                        let can_go = self.tab_scroll_offset < max_scroll - 1.0;
+                        let icon_color = if can_go { text_color } else { dim };
+                        let resp = ui.add(
+                            egui::Button::new(RichText::new(ICON_CHEVRON_R).size(16.0).color(icon_color))
+                                .frame(false)
+                                .min_size(Vec2::new(ARROW_W, 28.0))
+                        ).on_hover_text("Scroll tabs right");
+                        if resp.clicked() && can_go {
+                            self.tab_scroll_offset += 130.0;
+                        }
+                    }
+
+                    // ── + new tab button (pinned right of arrows) ─────────────
                     ui.separator();
                     let can_add   = self.tabs.len() < MAX_TABS;
-                    let add_color = if can_add { ui.visuals().text_color() } else { Color32::from_rgb(80,80,90) };
+                    let add_color = if can_add { text_color } else { Color32::from_rgb(80,80,90) };
                     if ui.add_enabled(can_add,
                         egui::Button::new(RichText::new("+").size(18.0).color(add_color))
                             .frame(false).min_size(Vec2::new(32.0, 28.0))
                     ).on_hover_text("New tab (Ctrl+T)").clicked() { self.add_tab(); }
-
-                    if let Some(i) = switch_to  { self.active_tab = i; }
-                    if let Some(i) = close_idx  {
-                        if self.tabs.len() > 1 {
-                            self.modal = Modal::CloseTab(i);
-                        }
-                    }
-                    if let Some(i) = rename_idx {
-                        self.rename_buf   = self.tabs[i].name.clone();
-                        self.renaming_tab = Some(i);
-                    }
-                    if let Some(i) = lock_idx {
-                        self.tabs[i].locked = true;
-                        self.dirty = true;
-                    }
                 });
+
+                if let Some(i) = switch_to  { self.active_tab = i; }
+                if let Some(i) = close_idx  {
+                    if self.tabs.len() > 1 { self.modal = Modal::CloseTab(i); }
+                }
+                if let Some(i) = rename_idx {
+                    self.rename_buf   = self.tabs[i].name.clone();
+                    self.renaming_tab = Some(i);
+                }
+                if let Some(i) = lock_idx {
+                    self.tabs[i].locked = true;
+                    self.dirty = true;
+                }
             });
     }
 
@@ -1105,70 +1266,144 @@ impl SecureNote {
     // ── Find / Replace bar ────────────────────────────────────────────────────
 
     fn ui_search_bar(&mut self, ctx: &egui::Context) {
-        let height = if self.replace_mode { 72.0 } else { 40.0 };
+        let height = if self.replace_mode { 68.0 } else { 38.0 };
         let bg     = if self.prefs.dark_mode { Color32::from_rgb(28,28,34)  } else { Color32::from_rgb(235,235,230) };
         let border = if self.prefs.dark_mode { Color32::from_rgb(46,46,56)  } else { Color32::from_rgb(204,204,196) };
+        let dim    = Color32::from_rgb(136, 136, 160);
+        let accent = Color32::from_rgb(124, 106, 247);
+        let error  = Color32::from_rgb(224, 80, 80);
 
         egui::TopBottomPanel::top("search_bar")
             .exact_height(height)
             .frame(egui::Frame::none()
                 .fill(bg)
                 .stroke(Stroke::new(1.0, border))
-                .inner_margin(egui::Margin::symmetric(10.0, 6.0)))
+                .inner_margin(egui::Margin::symmetric(10.0, 4.0)))
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Find:").size(12.0));
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.search_query)
-                            .desired_width(200.0)
-                            .font(FontId::monospace(12.0))
-                            .hint_text("search…")
-                    );
-                    if resp.changed() { self.run_search(); }
+                egui::Grid::new("search_grid")
+                    .num_columns(2)
+                    .spacing([6.0, 4.0])
+                    .show(ui, |ui| {
+                        // ── Row 1: Find ───────────────────────────────────────
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.set_min_width(60.0);
+                            ui.label(RichText::new("Find:").size(12.0).color(dim));
+                        });
+                        ui.horizontal(|ui| {
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut self.search_query)
+                                    .id(egui::Id::new("search_input"))
+                                    .desired_width(200.0)
+                                    .font(FontId::monospace(12.0))
+                                    .hint_text("search…")
+                            );
+                            if self.search_needs_focus {
+                                resp.request_focus();
+                                self.search_needs_focus = false;
+                            }
+                            if resp.changed() { self.run_search(); }
 
-                    let count_str = if self.search_results.is_empty() {
-                        "No matches".to_string()
-                    } else {
-                        format!("{}/{}", self.search_idx + 1, self.search_results.len())
-                    };
-                    ui.label(RichText::new(count_str).size(11.0).color(Color32::from_rgb(136,136,160)));
+                            // Regex toggle — highlighted when active, red when pattern is invalid
+                            let rx_color = if self.search_regex_error {
+                                error
+                            } else if self.search_regex {
+                                accent
+                            } else {
+                                dim
+                            };
+                            let rx_btn = ui.add(
+                                egui::Button::new(RichText::new(".*").size(11.0).monospace().color(rx_color))
+                                    .min_size(Vec2::new(24.0, 18.0))
+                            ).on_hover_text("Toggle regex mode");
+                            if rx_btn.clicked() {
+                                self.search_regex = !self.search_regex;
+                                self.run_search();
+                            }
 
-                    if ui.button("^").on_hover_text("Previous (Shift+Enter)").clicked()
-                        && !self.search_results.is_empty()
-                    {
-                        let len = self.search_results.len();
-                        self.search_idx = (self.search_idx + len - 1) % len;
-                    }
-                    if ui.button("v").on_hover_text("Next (Enter)").clicked()
-                        && !self.search_results.is_empty()
-                    {
-                        self.search_idx = (self.search_idx + 1) % self.search_results.len();
-                    }
+                            let count_str = if self.search_regex_error {
+                                "bad pattern".to_string()
+                            } else if self.search_results.is_empty() {
+                                if self.search_query.is_empty() { String::new() } else { "no match".to_string() }
+                            } else {
+                                format!("{}/{}", self.search_idx + 1, self.search_results.len())
+                            };
+                            let count_color = if self.search_regex_error { error } else { dim };
+                            if !count_str.is_empty() {
+                                ui.label(RichText::new(&count_str).size(11.0).color(count_color));
+                            }
 
-                    let rep_lbl = if self.replace_mode { "[-] Replace" } else { "[+] Replace" };
-                    if ui.button(RichText::new(rep_lbl).size(11.0)).clicked() {
-                        self.replace_mode = !self.replace_mode;
-                    }
+                            if ui.add(egui::Button::new(
+                                    RichText::new(ICON_PREV).size(16.0)
+                                ).min_size(Vec2::new(20.0, 18.0)))
+                                .on_hover_text("Previous").clicked()
+                                && !self.search_results.is_empty()
+                            {
+                                let len = self.search_results.len();
+                                self.search_idx = (self.search_idx + len - 1) % len;
+                            }
+                            if ui.add(egui::Button::new(
+                                    RichText::new(ICON_NEXT).size(16.0)
+                                ).min_size(Vec2::new(20.0, 18.0)))
+                                .on_hover_text("Next").clicked()
+                                && !self.search_results.is_empty()
+                            {
+                                self.search_idx = (self.search_idx + 1) % self.search_results.len();
+                            }
 
-                    if ui.button(RichText::new("[x]").size(11.0)).clicked() {
-                        self.search_open = false;
-                    }
-                });
+                            ui.separator();
+                            let (rep_icon, rep_tip) = if self.replace_mode {
+                                (ICON_REMOVE, "Hide Replace")
+                            } else {
+                                (ICON_ADD, "Show Replace")
+                            };
+                            if ui.add(egui::Button::new(
+                                    RichText::new(format!("{rep_icon} Replace")).size(12.0)
+                                ).min_size(Vec2::new(0.0, 18.0)))
+                                .on_hover_text(rep_tip).clicked()
+                            {
+                                self.replace_mode = !self.replace_mode;
+                            }
+                            if ui.add(egui::Button::new(
+                                    RichText::new(ICON_CLOSE).size(16.0)
+                                ).min_size(Vec2::new(20.0, 18.0)))
+                                .on_hover_text("Close (Escape)").clicked()
+                            {
+                                self.search_open = false;
+                            }
+                        });
+                        ui.end_row();
 
-                if self.replace_mode {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Replace:").size(12.0));
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.replace_query)
-                                .desired_width(200.0)
-                                .font(FontId::monospace(12.0))
-                                .hint_text("replacement…")
-                        );
-                        if ui.button(RichText::new("Replace All").size(11.0)).clicked() {
-                            self.replace_all();
+                        // ── Row 2: Replace (only in replace mode) ─────────────
+                        if self.replace_mode {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.set_min_width(60.0);
+                                ui.label(RichText::new("Replace:").size(12.0).color(dim));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.replace_query)
+                                        .desired_width(200.0)
+                                        .font(FontId::monospace(12.0))
+                                        .hint_text("replacement…")
+                                );
+                                let has_match = !self.search_results.is_empty();
+                                if ui.add_enabled(has_match, egui::Button::new(
+                                    RichText::new("Replace").size(11.0)
+                                )).on_hover_text("Replace current match").clicked() {
+                                    self.replace_current();
+                                }
+                                if ui.small_button("Replace All").on_hover_text("Replace all matches").clicked() {
+                                    self.replace_all();
+                                }
+                                if ui.add_enabled(has_match, egui::Button::new(
+                                    RichText::new("Skip").size(11.0)
+                                )).on_hover_text("Skip to next match").clicked() {
+                                    self.skip_match();
+                                }
+                            });
+                            ui.end_row();
                         }
                     });
-                }
             });
     }
 
@@ -1180,7 +1415,7 @@ impl SecureNote {
             let bg = if self.prefs.dark_mode { Color32::from_rgb(18,18,22) } else { Color32::from_rgb(240,240,235) };
             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                 ui.add_space(ui.available_height() / 3.0);
-                ui.label(RichText::new("🔒").size(40.0));
+                ui.label(RichText::new(ICON_LOCK).size(40.0));
                 ui.add_space(8.0);
                 ui.label(RichText::new("This tab is locked").size(14.0)
                     .color(Color32::from_rgb(180, 150, 60)));
@@ -1230,10 +1465,13 @@ impl SecureNote {
         ui.visuals_mut().selection.stroke =
             Stroke::new(1.0, Color32::from_rgb(180, 170, 255));
 
+        let editor_id = egui::Id::new("editor");
+
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let output = egui::TextEdit::multiline(&mut self.tabs[self.active_tab].content)
+                    .id(editor_id)
                     .font(FontId::monospace(self.prefs.font_size))
                     .desired_width(available.x)
                     .desired_rows(1)
@@ -1241,6 +1479,7 @@ impl SecureNote {
                     .frame(false)
                     .lock_focus(true)
                     .show(ui);
+
                 if output.response.changed() {
                     self.dirty = true;
                     self.last_edit_time = now;
@@ -1258,7 +1497,72 @@ impl SecureNote {
                         .map(|p| before[p + 1..].chars().count())
                         .unwrap_or_else(|| before.chars().count());
                 }
+
+                // Draw search match highlights using the painter after the TextEdit renders.
+                // Semi-transparent rects are drawn over the text; the text remains readable
+                // through the highlight because of the alpha channel.
+                if self.search_open && !self.search_results.is_empty() {
+                    let text    = &self.tabs[self.active_tab].content;
+                    let painter = ui.painter();
+
+                    for (match_idx, &(start_byte, end_byte)) in self.search_results.iter().enumerate() {
+                        let sb = start_byte.min(text.len());
+                        let eb = end_byte.min(text.len());
+                        let start_char = text[..sb].chars().count();
+                        let end_char   = text[..eb].chars().count();
+
+                        let color = if match_idx == self.search_idx {
+                            Color32::from_rgba_unmultiplied(124, 106, 247, 140)
+                        } else {
+                            Color32::from_rgba_unmultiplied(200, 170, 60, 80)
+                        };
+
+                        let sc = egui::text::CCursor { index: start_char, prefer_next_row: false };
+                        let ec = egui::text::CCursor { index: end_char,   prefer_next_row: false };
+                        let start_cur = output.galley.from_ccursor(sc);
+                        let end_cur   = output.galley.from_ccursor(ec);
+
+                        let start_row = start_cur.rcursor.row;
+                        let end_row   = end_cur.rcursor.row.min(output.galley.rows.len().saturating_sub(1));
+
+                        for row_idx in start_row..=end_row {
+                            if row_idx >= output.galley.rows.len() { break; }
+                            let row   = &output.galley.rows[row_idx];
+                            let x0 = if row_idx == start_row {
+                                output.galley.pos_from_cursor(&start_cur).min.x
+                            } else {
+                                row.rect.min.x
+                            };
+                            let x1 = if row_idx == end_row {
+                                output.galley.pos_from_cursor(&end_cur).min.x
+                            } else {
+                                row.rect.max.x
+                            };
+                            let rect = egui::Rect::from_min_max(
+                                output.galley_pos + egui::Vec2::new(x0, row.rect.min.y),
+                                output.galley_pos + egui::Vec2::new(x1.max(x0 + 4.0), row.rect.max.y),
+                            );
+                            painter.rect_filled(rect, 2.0, color);
+                        }
+                    }
+                }
             });
+
+        // Tell egui's Focus::begin_frame that this widget owns Escape.  begin_frame
+        // runs on RawInput before update() and unconditionally clears focus when
+        // Escape is pressed and the focused widget's EventFilter has escape:false
+        // (the default).  consume_key cannot help because it operates on InputState,
+        // not RawInput.  Setting escape:true here takes effect on the next frame and
+        // prevents that focus-clearing path from firing while the editor is active.
+        ctx.memory_mut(|mem| mem.set_focus_lock_filter(
+            editor_id,
+            egui::EventFilter {
+                tab:                true,
+                horizontal_arrows:  true,
+                vertical_arrows:    true,
+                escape:             true,
+            },
+        ));
     }
 
     // ── Preferences panel ─────────────────────────────────────────────────────

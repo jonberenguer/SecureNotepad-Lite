@@ -27,10 +27,10 @@ A cross-platform native desktop notepad with AES-256-GCM encryption. No web brow
 | | |
 |---|---|
 | 🔐 | **AES-256-GCM** encryption with **PBKDF2-SHA256** key derivation (310,000 iterations) |
-| 📑 | Up to **5 named encrypted tabs** |
+| 📑 | Up to **5 named encrypted tabs** with scroll arrows and mouse-wheel navigation in the tab bar |
 | 💾 | **Auto-save** with configurable delay; always saves on window close |
 | 💥 | **Crash-safe saves** — writes to a temp file and renames atomically, so a crash mid-write never corrupts `notes.enc` |
-| 🔍 | **Find & Replace** with match counter and prev/next navigation |
+| 🔍 | **Find & Replace** with regex support, match counter, and prev/next navigation |
 | 🔁 | **Undo / Redo** (`Ctrl+Z` / `Ctrl+Y`) — per-tab snapshot history, preserved across tab switches |
 | 🔒 | **Per-tab locking** — lock individual tabs behind the master password for screen-sharing safety |
 | ⏱️ | **Auto-lock on idle** — configurable inactivity timeout that saves and locks automatically |
@@ -38,7 +38,7 @@ A cross-platform native desktop notepad with AES-256-GCM encryption. No web brow
 | 🗂️ | **Export** current tab as `.txt` (toolbar or `Ctrl+E`) |
 | 📥 | **Import** a `.txt` file as a new tab (toolbar or `Ctrl+I`) |
 | 🎨 | **Dark / Light** theme toggle |
-| 🖱️ | **Ln / Col** cursor position in status bar (Unicode-aware) |
+| 🖱️ | **Status bar** — Ln / Col cursor position, word count, and character count (Unicode-aware) |
 | 📁 | **Data directory path** shown in status bar |
 | ⚙️ | **Preferences** panel — font size, auto-save delay, auto-lock delay, clipboard-clear delay, theme |
 | 🪟 | **Window position and size** restored on next launch |
@@ -46,7 +46,6 @@ A cross-platform native desktop notepad with AES-256-GCM encryption. No web brow
 | 🔒 | **Single instance** enforcement via PID lock file |
 | 🖼️ | **Custom app icon** — drop `icon.png` in the data directory, no recompile needed |
 | 🗂️ | **`--file` flag** — open a specific `.enc` file directly, bypassing the default data directory |
-| 🔗 | **Wire-format compatible** — `notes.enc` files are interchangeable with the web version |
 
 ---
 
@@ -156,6 +155,25 @@ secure-notes/
 | `Ctrl+1` … `Ctrl+5` | Switch to tab 1–5 |
 | `Ctrl+,` | Toggle Preferences panel |
 | `Escape` | Close Find bar / close Preferences panel |
+
+---
+
+## Tab Bar
+
+When two or more tabs are open, scroll arrows appear on each side of the tab bar to reveal tabs that don't fit the window width. The tab strip can also be scrolled with the mouse wheel while hovering over the tab bar — scrolling up moves left, scrolling down moves right.
+
+Double-click a tab name to rename it inline (press Enter to confirm, Escape to cancel).
+
+---
+
+## Find & Replace
+
+Open with `Ctrl+F` (find only) or `Ctrl+H` (find + replace). All matches are highlighted in the editor as you type.
+
+- **`.*` button** — toggles regex mode. The button turns red if the pattern is invalid. In plain-text mode the search is case-insensitive; in regex mode the pattern is matched as written.
+- **Match counter** — shows `current / total` matches.
+- **Prev / Next arrows** — cycle through matches.
+- **Replace / Replace All / Skip** — available in replace mode (`Ctrl+H`).
 
 ---
 
@@ -301,8 +319,6 @@ base64( salt[32 bytes] || iv[12 bytes] || auth_tag[16 bytes] || ciphertext )
 - **Password verification:** constant-time comparison (`subtle` crate) to prevent timing attacks; stored hash length is hard-coded to 64 bytes to prevent truncation attacks
 - **Session:** in-memory only, no token written to disk; password, tab contents, undo history, and all derived key material are zeroed on lock
 
-This format is identical to the original Node.js web version, so `notes.enc` files are fully interchangeable between the two.
-
 ---
 
 ## Platform Support
@@ -329,6 +345,7 @@ Windows will need [Microsoft Visual C++ Redistributable](https://aka.ms/vs/17/re
 | `rand` | Cryptographically secure random bytes |
 | `subtle` | Constant-time byte comparison |
 | `zeroize` | Zero sensitive memory (passwords, tab contents) on lock |
+| `regex` | Regex matching in the Find & Replace bar |
 | `rfd` | Native file dialogs for export / import |
 | `hex` | Hex encoding/decoding |
 | `base64` | Base64 encoding/decoding |

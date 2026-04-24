@@ -110,6 +110,7 @@ fn resize(img: &RgbaImage, size: u32) -> RgbaImage {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=assets/MaterialIcons-Regular.ttf");
 
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 

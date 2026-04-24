@@ -20,6 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy manifests first so dependency compilation is cached in a separate layer.
 # Rebuilding after source-only changes skips the slow dep compilation step.
 COPY Cargo.toml Cargo.lock build.rs ./
+COPY assets ./assets
 
 # Build a stub binary to pre-compile and cache all dependencies.
 RUN mkdir -p src && echo 'fn main() {}' > src/main.rs \
