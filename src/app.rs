@@ -1729,6 +1729,11 @@ impl SecureNote {
         }
 
         let available = ui.available_size();
+        // The editor's visible viewport (below the tab bar, above the status bar).
+        // Captured here at the panel level because a ScrollArea's clip rect is only
+        // tight when its content overflows — when the content fits, it extends past
+        // the viewport and must not be used to bound the line-number gutter.
+        let viewport = ui.available_rect_before_wrap();
 
         ui.visuals_mut().selection.bg_fill =
             Color32::from_rgba_unmultiplied(124, 106, 247, 180);
@@ -1910,18 +1915,19 @@ impl SecureNote {
                 // moves them) and aligned to each galley row, which keeps them
                 // correct even when a logical line wraps over several visual rows.
                 if line_nums {
-                    let clip    = ui.clip_rect();
                     let origin  = output.galley_pos;
-                    let painter = ui.painter();
+                    // Clip the gutter strictly to the editor viewport so it never
+                    // paints over the panels above/below when the content fits.
+                    let painter = ui.painter().with_clip_rect(viewport);
 
                     let gutter_rect = egui::Rect::from_min_max(
-                        egui::pos2(clip.min.x, clip.min.y),
-                        egui::pos2(clip.min.x + gutter_w, clip.max.y),
+                        egui::pos2(viewport.min.x, viewport.min.y),
+                        egui::pos2(viewport.min.x + gutter_w, viewport.max.y),
                     );
                     painter.rect_filled(gutter_rect, 0.0, gutter_bg);
                     painter.line_segment(
-                        [egui::pos2(clip.min.x + gutter_w, clip.min.y),
-                         egui::pos2(clip.min.x + gutter_w, clip.max.y)],
+                        [egui::pos2(viewport.min.x + gutter_w, viewport.min.y),
+                         egui::pos2(viewport.min.x + gutter_w, viewport.max.y)],
                         Stroke::new(1.0, divider),
                     );
 
@@ -1942,7 +1948,7 @@ impl SecureNote {
                             };
                             let color = if logical == cur { cur_color } else { num_color };
                             painter.text(
-                                egui::pos2(clip.min.x + gutter_w - 6.0, origin.y + row.rect.min.y),
+                                egui::pos2(viewport.min.x + gutter_w - 6.0, origin.y + row.rect.min.y),
                                 egui::Align2::RIGHT_TOP,
                                 label,
                                 num_font.clone(),
