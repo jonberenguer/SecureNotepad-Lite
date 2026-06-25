@@ -39,6 +39,10 @@ clap = { version = "4", features = ["derive"] }
 # Native file dialogs (export / import)
 rfd = "0.14"
 
+# OS clipboard read access for the editor right-click "Paste" action.
+# (eframe already depends on arboard transitively; listed here for direct use.)
+arboard = "3"
+
 # Regex support for find/replace
 regex = "1"
 

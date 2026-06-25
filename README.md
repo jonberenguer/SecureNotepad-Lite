@@ -30,8 +30,14 @@ A cross-platform native desktop notepad with AES-256-GCM encryption. No web brow
 | 📑 | Up to **5 named encrypted tabs** with scroll arrows and mouse-wheel navigation in the tab bar |
 | 💾 | **Auto-save** with configurable delay; always saves on window close |
 | 💥 | **Crash-safe saves** — writes to a temp file and renames atomically, so a crash mid-write never corrupts `notes.enc` |
+| 🖱️ | **Right-click menus** — editor (Cut / Copy / Paste / Select All / Undo / Redo) and tab headers (Rename, Lock/Unlock, Close, New tab, Export, Import) |
+| 🔎 | **Ctrl + mouse wheel** to grow/shrink the editor font, with a one-click **reset to default** in the status bar |
+| 📝 | **Markdown live preview** — toggle a side pane that renders the current tab as Markdown |
+| ↩️ | **Word wrap** toggle — wrap to width, or turn off for horizontal scrolling |
+| #️⃣ | **Line numbers** with optional **relative** (vim-style) mode — aligned correctly even when lines wrap |
+| 🔤 | **Embedded editor fonts** — built-in monospace plus **JetBrains Mono** and **Hack**, selectable in Preferences |
 | 🔍 | **Find & Replace** with regex support, match counter, and prev/next navigation |
-| 🔁 | **Undo / Redo** (`Ctrl+Z` / `Ctrl+Y`) — per-tab snapshot history, preserved across tab switches |
+| 🔁 | **Undo / Redo** — toolbar buttons (next to Save) or `Ctrl+Z` / `Ctrl+Y`; per-tab snapshot history, preserved across tab switches |
 | 🔒 | **Per-tab locking** — lock individual tabs behind the master password for screen-sharing safety |
 | ⏱️ | **Auto-lock on idle** — configurable inactivity timeout that saves and locks automatically |
 | 📋 | **Clipboard auto-clear** — copied text is overwritten after a configurable delay (default 30 s) |
@@ -40,7 +46,7 @@ A cross-platform native desktop notepad with AES-256-GCM encryption. No web brow
 | 🎨 | **Dark / Light** theme toggle |
 | 🖱️ | **Status bar** — Ln / Col cursor position, word count, and character count (Unicode-aware) |
 | 📁 | **Data directory path** shown in status bar |
-| ⚙️ | **Preferences** panel — font size, auto-save delay, auto-lock delay, clipboard-clear delay, theme |
+| ⚙️ | **Preferences** panel — editor font & word wrap, line numbers, font size, auto-save delay, auto-lock delay, clipboard-clear delay, theme |
 | 🪟 | **Window position and size** restored on next launch |
 | 🛡️ | Constant-time password comparison, memory-zeroed on lock/exit, change password with rollback-safe re-encryption |
 | 🔒 | **Single instance** enforcement via PID lock file |
@@ -163,6 +169,37 @@ secure-notes/
 When two or more tabs are open, scroll arrows appear on each side of the tab bar to reveal tabs that don't fit the window width. The tab strip can also be scrolled with the mouse wheel while hovering over the tab bar — scrolling up moves left, scrolling down moves right.
 
 Double-click a tab name to rename it inline (press Enter to confirm, Escape to cancel).
+
+---
+
+## Right-Click Menus
+
+**In the editor**, right-click to open a context menu with **Cut**, **Copy**, **Paste**, **Select All**, **Undo**, and **Redo**. Cut/Copy act on the current selection (and are disabled when nothing is selected); Paste reads the OS clipboard and inserts at the cursor, replacing any selection. Copied text still honours the **Clipboard auto-clear** setting.
+
+**On a tab header**, right-click for **Rename**, **Lock/Unlock**, **Close**, **New tab**, **Export**, and **Import** — the same actions available from the toolbar, scoped to the tab you clicked. Rename and Export are disabled for locked tabs.
+
+---
+
+## Font Size
+
+Hold **Ctrl** and scroll the mouse wheel over the window to increase or decrease the editor font size (bounded 10–28 px). The current size is shown in the status bar; whenever it differs from the default (14 px) a **reset** button appears there to restore it. The size can also be set from **Preferences → FONT SIZE**, and is persisted across launches.
+
+---
+
+## Editor Options
+
+Configured under **Preferences → EDITOR** (all persisted across launches):
+
+- **Editor font** — choose the built-in **Monospace**, **JetBrains Mono**, or **Hack**. The fonts are embedded in the binary, so no system installation is required.
+- **Word wrap** — on by default; long lines wrap to the editor width. Turn it off to keep lines unwrapped with horizontal scrolling instead.
+- **Line numbers** — show a line-number gutter. The gutter is pinned to the left and aligned to each rendered row, so numbers stay correct even when **word wrap** splits a logical line across several visual rows.
+- **Relative numbers** — when line numbers are on, show each line's distance from the cursor line (vim-style), with the current line showing its absolute number.
+
+---
+
+## Markdown Preview
+
+The editor content is always treated as Markdown. Click **Preview** in the toolbar to toggle a resizable side pane that renders the current tab — headings, **bold**/*italic*, `inline code`, fenced code blocks, ordered/unordered lists, blockquotes, horizontal rules, and links. The preview updates live as you type and is hidden automatically for locked tabs. The toggle state is remembered between launches.
 
 ---
 
@@ -347,6 +384,7 @@ Windows will need [Microsoft Visual C++ Redistributable](https://aka.ms/vs/17/re
 | `zeroize` | Zero sensitive memory (passwords, tab contents) on lock |
 | `regex` | Regex matching in the Find & Replace bar |
 | `rfd` | Native file dialogs for export / import |
+| `arboard` | OS clipboard read for the editor's right-click **Paste** |
 | `hex` | Hex encoding/decoding |
 | `base64` | Base64 encoding/decoding |
 | `serde` / `serde_json` | JSON serialization for config and prefs |

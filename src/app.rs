@@ -1,4 +1,5 @@
 use crate::crypto::{hash_password, verify_password};
+use crate::markdown;
 use crate::storage::{
     Prefs, Tab,
     default_tabs, load_config, load_prefs, load_tabs,
@@ -15,12 +16,37 @@ pub const MAX_TABS:      usize = 5;
 const MAX_UNDO:          usize = 50;
 const UNDO_INTERVAL:     f64   = 1.5;
 
+// Editor font-size bounds (must match the Preferences slider range).
+const FONT_MIN:     f32 = 10.0;
+const FONT_MAX:     f32 = 28.0;
+const FONT_DEFAULT: f32 = 14.0;
+
+/// Selectable editor fonts: (display name, registered egui family key).
+/// An empty family key falls back to the built-in monospace family.
+/// Embedded fonts are registered in `setup_fonts` under the same key.
+const EDITOR_FONTS: &[(&str, &str)] = &[
+    ("Monospace",      ""),
+    ("JetBrains Mono", "JetBrains Mono"),
+    ("Hack",           "Hack"),
+];
+
+/// Convert a character index into a byte offset within `s`.
+fn char_to_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
+}
+
 // ─── Material Icons font ──────────────────────────────────────────────────────
 
 static MATERIAL_ICONS: &[u8] = include_bytes!("../assets/MaterialIcons-Regular.ttf");
 
+// Embedded selectable editor fonts (registered as named families in setup_fonts).
+static JETBRAINS_MONO: &[u8] = include_bytes!("../assets/JetBrainsMono-Regular.ttf");
+static HACK_MONO:      &[u8] = include_bytes!("../assets/Hack-Regular.ttf");
+
 // Codepoints from the Material Icons Regular font.
 const ICON_SAVE:      &str = "\u{e161}"; // save
+const ICON_UNDO:      &str = "\u{e166}"; // undo
+const ICON_REDO:      &str = "\u{e15a}"; // redo
 const ICON_EXPORT:    &str = "\u{e2c3}"; // file_upload
 const ICON_IMPORT:    &str = "\u{e2c4}"; // file_download
 const ICON_LOCK:      &str = "\u{e897}"; // lock
@@ -52,6 +78,23 @@ pub fn setup_fonts(ctx: &egui::Context) {
         .entry(FontFamily::Monospace)
         .or_default()
         .push("material_icons".to_owned());
+
+    // Register the embedded editor fonts as named families. Each keeps the
+    // default monospace fallback chain (icons, emoji, broad Unicode) so glyphs
+    // missing from the chosen font still render.
+    fonts.font_data.insert("jetbrains_mono".to_owned(), egui::FontData::from_static(JETBRAINS_MONO));
+    fonts.font_data.insert("hack_mono".to_owned(),      egui::FontData::from_static(HACK_MONO));
+
+    let fallback = fonts.families.get(&FontFamily::Monospace).cloned().unwrap_or_default();
+
+    let mut jb = vec!["jetbrains_mono".to_owned()];
+    jb.extend(fallback.clone());
+    fonts.families.insert(FontFamily::Name("JetBrains Mono".into()), jb);
+
+    let mut hk = vec!["hack_mono".to_owned()];
+    hk.extend(fallback);
+    fonts.families.insert(FontFamily::Name("Hack".into()), hk);
+
     ctx.set_fonts(fonts);
 }
 
@@ -147,6 +190,10 @@ pub struct SecureNote {
     tab_scroll_offset: f32,
     tab_overflow:      bool,
 
+    // Selection latched when the editor context menu opens, so right-click
+    // doesn't lose the highlighted range the menu operates on.
+    context_sel: Option<(usize, usize)>,
+
     // Per-tab undo/redo history keyed by tab.id
     undo_stacks:      HashMap<u32, Vec<String>>,
     undo_positions:   HashMap<u32, usize>,
@@ -208,6 +255,7 @@ impl SecureNote {
             clipboard_clear_at:    None,
             tab_scroll_offset:  0.0,
             tab_overflow:       false,
+            context_sel:        None,
             undo_stacks:        HashMap::new(),
             undo_positions:     HashMap::new(),
             undo_last_snap:     0.0,
@@ -639,6 +687,112 @@ impl SecureNote {
             }
         }
     }
+
+    // ── Font size ───────────────────────────────────────────────────────────────
+
+    fn set_font_size(&mut self, size: f32) {
+        let clamped = size.clamp(FONT_MIN, FONT_MAX).round();
+        if (clamped - self.prefs.font_size).abs() > f32::EPSILON {
+            self.prefs.font_size = clamped;
+            self.persist_prefs();
+        }
+    }
+
+    // ── Editor clipboard / selection (right-click menu) ──────────────────────────
+
+    /// Current selection in the editor as a `(start, end)` char-index range,
+    /// read from the persisted TextEdit state so it works even without focus.
+    fn editor_selection(&self, ctx: &egui::Context, editor_id: egui::Id) -> Option<(usize, usize)> {
+        egui::text_edit::TextEditState::load(ctx, editor_id)
+            .and_then(|s| s.cursor.char_range())
+            .map(|r| {
+                let a = r.primary.index;
+                let b = r.secondary.index;
+                (a.min(b), a.max(b))
+            })
+    }
+
+    fn editor_set_cursor(&self, ctx: &egui::Context, editor_id: egui::Id, range: egui::text::CCursorRange) {
+        let mut state = egui::text_edit::TextEditState::load(ctx, editor_id).unwrap_or_default();
+        state.cursor.set_char_range(Some(range));
+        state.store(ctx, editor_id);
+        ctx.memory_mut(|m| m.request_focus(editor_id));
+    }
+
+    fn editor_copy(&mut self, ctx: &egui::Context, sel: Option<(usize, usize)>) {
+        if let Some((a, b)) = sel {
+            if b > a {
+                let s: String = self.tabs[self.active_tab].content.chars().skip(a).take(b - a).collect();
+                ctx.output_mut(|o| o.copied_text = s);
+            }
+        }
+    }
+
+    fn editor_cut(&mut self, ctx: &egui::Context, editor_id: egui::Id, sel: Option<(usize, usize)>, now: f64) {
+        if let Some((a, b)) = sel {
+            if b > a {
+                let content = &mut self.tabs[self.active_tab].content;
+                let ba = char_to_byte(content, a);
+                let bb = char_to_byte(content, b);
+                let cut = content[ba..bb].to_string();
+                content.replace_range(ba..bb, "");
+                ctx.output_mut(|o| o.copied_text = cut);
+                self.dirty = true;
+                self.last_edit_time = now;
+                self.editor_set_cursor(ctx, editor_id,
+                    egui::text::CCursorRange::one(egui::text::CCursor::new(a)));
+                self.context_sel = None;
+            }
+        }
+    }
+
+    fn editor_paste(&mut self, ctx: &egui::Context, editor_id: egui::Id, sel: Option<(usize, usize)>, now: f64) {
+        let pasted = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok());
+        let Some(text) = pasted else { return };
+        if text.is_empty() { return; }
+        let (a, b) = sel.unwrap_or_else(|| {
+            let n = self.tabs[self.active_tab].content.chars().count();
+            (n, n)
+        });
+        let content = &mut self.tabs[self.active_tab].content;
+        let ba = char_to_byte(content, a);
+        let bb = char_to_byte(content, b);
+        content.replace_range(ba..bb, &text);
+        self.dirty = true;
+        self.last_edit_time = now;
+        let new_pos = a + text.chars().count();
+        self.editor_set_cursor(ctx, editor_id,
+            egui::text::CCursorRange::one(egui::text::CCursor::new(new_pos)));
+        self.context_sel = None;
+    }
+
+    fn editor_select_all(&mut self, ctx: &egui::Context, editor_id: egui::Id) {
+        let n = self.tabs[self.active_tab].content.chars().count();
+        self.editor_set_cursor(ctx, editor_id, egui::text::CCursorRange::two(
+            egui::text::CCursor::new(0),
+            egui::text::CCursor::new(n),
+        ));
+    }
+
+    /// `(can_undo, can_redo)` for the active tab.
+    fn active_undo_state(&self) -> (bool, bool) {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            let pos = *self.undo_positions.get(&tab.id).unwrap_or(&0);
+            let len = self.undo_stacks.get(&tab.id).map(|s| s.len()).unwrap_or(0);
+            (pos > 0, pos + 1 < len)
+        } else {
+            (false, false)
+        }
+    }
+
+    /// Resolve the configured editor-font name to a registered egui font family.
+    /// Unknown names fall back to the built-in monospace family.
+    fn editor_font_family(&self) -> FontFamily {
+        match EDITOR_FONTS.iter().find(|(name, _)| self.prefs.editor_font == *name) {
+            Some((_, fam)) if !fam.is_empty() => FontFamily::Name((*fam).into()),
+            _ => FontFamily::Monospace,
+        }
+    }
 }
 
 // ─── eframe App trait ─────────────────────────────────────────────────────────
@@ -864,6 +1018,20 @@ impl SecureNote {
         self.ui_tabbar(ctx);
         if self.search_open { self.ui_search_bar(ctx); }
         self.ui_statusbar(ctx);
+
+        // Markdown live-preview pane (hidden for locked tabs).
+        let show_preview = self.prefs.preview_open
+            && self.tabs.get(self.active_tab).map(|t| !t.locked).unwrap_or(false);
+        if show_preview {
+            egui::SidePanel::right("md_preview")
+                .resizable(true)
+                .min_width(180.0)
+                .default_width((ctx.screen_rect().width() * 0.42).max(220.0))
+                .show(ctx, |ui| {
+                    self.ui_markdown_preview(ui);
+                });
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             self.ui_text_editor(ui, ctx, now);
         });
@@ -871,8 +1039,43 @@ impl SecureNote {
         self.ui_modals(ctx);
     }
 
+    fn ui_markdown_preview(&mut self, ui: &mut egui::Ui) {
+        let dim = Color32::from_rgb(136, 136, 160);
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("PREVIEW").size(10.0).strong().color(dim));
+        });
+        ui.add_space(4.0);
+        ui.separator();
+        let content = self.tabs.get(self.active_tab).map(|t| t.content.clone()).unwrap_or_default();
+        let base    = self.prefs.font_size;
+        let dark    = self.prefs.dark_mode;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                markdown::render(ui, &content, base, dark);
+            });
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let ctrl = ctx.input(|i| i.modifiers.ctrl || i.modifiers.mac_cmd);
+
+        // Ctrl + mouse wheel adjusts the editor font size.
+        let wheel: f32 = ctx.input(|i| {
+            i.events.iter().filter_map(|ev| {
+                if let egui::Event::MouseWheel { delta, modifiers, .. } = ev {
+                    if modifiers.ctrl || modifiers.mac_cmd || modifiers.command {
+                        return Some(delta.y);
+                    }
+                }
+                None
+            }).sum()
+        });
+        if wheel != 0.0 {
+            let step = if wheel > 0.0 { 1.0 } else { -1.0 };
+            self.set_font_size(self.prefs.font_size + step);
+        }
 
         if ctrl && ctx.input(|i| i.key_pressed(EKey::S)) { self.save_now(ctx); }
 
@@ -933,12 +1136,24 @@ impl SecureNote {
                 .inner_margin(egui::Margin::symmetric(12.0, 0.0)))
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.label(RichText::new("SNote").monospace().size(13.0).strong().color(accent));
+                    ui.label(RichText::new("securenotes").monospace().size(13.0).strong().color(accent));
                     ui.separator();
 
                     if ui.button(RichText::new(format!("{ICON_SAVE} Save")).size(12.0))
                         .on_hover_text("Save (Ctrl+S)").clicked()
                     { self.save_now(ctx); }
+
+                    let (can_undo, can_redo) = self.active_undo_state();
+                    if ui.add_enabled(can_undo,
+                        egui::Button::new(RichText::new(ICON_UNDO).size(15.0)))
+                        .on_hover_text("Undo (Ctrl+Z)").clicked()
+                    { self.do_undo(ctx); }
+                    if ui.add_enabled(can_redo,
+                        egui::Button::new(RichText::new(ICON_REDO).size(15.0)))
+                        .on_hover_text("Redo (Ctrl+Y)").clicked()
+                    { self.do_redo(ctx); }
+
+                    ui.separator();
 
                     if ui.button(RichText::new(format!("{ICON_EXPORT} Export")).size(12.0))
                         .on_hover_text("Export current tab as .txt (Ctrl+E)").clicked()
@@ -988,6 +1203,14 @@ impl SecureNote {
                         if ui.button(RichText::new(format!("{ICON_SEARCH} Find")).size(12.0))
                             .on_hover_text("Find / Replace (Ctrl+F / Ctrl+H)").clicked()
                         { self.search_open = true; self.replace_mode = false; self.search_needs_focus = true; }
+
+                        let pvc = if self.prefs.preview_open { accent } else { ui.visuals().text_color() };
+                        if ui.button(RichText::new("Preview").size(12.0).color(pvc))
+                            .on_hover_text("Toggle Markdown preview").clicked()
+                        {
+                            self.prefs.preview_open = !self.prefs.preview_open;
+                            self.persist_prefs();
+                        }
                     });
                 });
             });
@@ -1012,10 +1235,13 @@ impl SecureNote {
                 const TAB_CLOSE_W:  f32   = 18.0;
                 const ARROW_W:      f32   = 28.0;
 
-                let mut switch_to  = None;
-                let mut close_idx  = None;
-                let mut rename_idx = None;
-                let mut lock_idx   = None;
+                let mut switch_to   = None;
+                let mut close_idx   = None;
+                let mut rename_idx  = None;
+                let mut lock_idx    = None;
+                let mut export_idx  = None;
+                let mut new_tab_req = false;
+                let mut import_req  = false;
 
                 let snapshot: Vec<(usize, String, bool, bool)> = self.tabs.iter().enumerate()
                     .map(|(i, t)| (i, t.name.clone(), i == self.active_tab, t.locked))
@@ -1138,6 +1364,27 @@ impl SecureNote {
                                     if resp.clicked()        { switch_to  = Some(i); }
                                     if resp.double_clicked() && !is_locked { rename_idx = Some(i); }
 
+                                    // Tab-header right-click menu (mirrors the toolbar actions).
+                                    resp.context_menu(|ui| {
+                                        ui.add_enabled_ui(!is_locked, |ui| {
+                                            if ui.button("Rename").clicked() { rename_idx = Some(i); ui.close_menu(); }
+                                        });
+                                        if is_locked {
+                                            if ui.button("Unlock…").clicked() { switch_to = Some(i); ui.close_menu(); }
+                                        } else if ui.button("Lock").clicked() {
+                                            lock_idx = Some(i); ui.close_menu();
+                                        }
+                                        if snapshot.len() > 1 && ui.button("Close").clicked() {
+                                            close_idx = Some(i); ui.close_menu();
+                                        }
+                                        ui.separator();
+                                        if ui.button("New tab").clicked() { new_tab_req = true; ui.close_menu(); }
+                                        ui.add_enabled_ui(!is_locked, |ui| {
+                                            if ui.button("Export…").clicked() { export_idx = Some(i); ui.close_menu(); }
+                                        });
+                                        if ui.button("Import…").clicked() { import_req = true; ui.close_menu(); }
+                                    });
+
                                     // ── Close button ──────────────────────────
                                     if !is_locked {
                                         let hovered = resp.hovered() || lock_btn.hovered();
@@ -1210,6 +1457,14 @@ impl SecureNote {
                     self.tabs[i].locked = true;
                     self.dirty = true;
                 }
+                if new_tab_req && self.tabs.len() < MAX_TABS { self.add_tab(); }
+                if import_req { self.do_import_tab(ctx); }
+                if let Some(i) = export_idx {
+                    if i < self.tabs.len() {
+                        self.active_tab = i;
+                        self.do_export_tab(ctx);
+                    }
+                }
             });
     }
 
@@ -1244,6 +1499,21 @@ impl SecureNote {
                     ui.separator();
                     ui.label(RichText::new("Chars ").size(11.0).monospace().color(dim));
                     ui.label(RichText::new(chars.to_string()).size(11.0).monospace().color(val));
+                    ui.separator();
+                    ui.label(RichText::new("Font ").size(11.0).monospace().color(dim));
+                    ui.label(RichText::new(format!("{}px", self.prefs.font_size as u32))
+                        .size(11.0).monospace().color(val));
+                    if (self.prefs.font_size - FONT_DEFAULT).abs() > f32::EPSILON {
+                        if ui.add(egui::Button::new(
+                                RichText::new("reset").size(10.0).monospace()
+                                    .color(Color32::from_rgb(124, 106, 247)))
+                                .frame(false))
+                            .on_hover_text("Reset font size to default (Ctrl+scroll to change)")
+                            .clicked()
+                        {
+                            self.set_font_size(FONT_DEFAULT);
+                        }
+                    }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new("enc").size(11.0).monospace()
@@ -1467,23 +1737,111 @@ impl SecureNote {
 
         let editor_id = egui::Id::new("editor");
 
-        egui::ScrollArea::vertical()
+        let font_size   = self.prefs.font_size;
+        let word_wrap   = self.prefs.word_wrap;
+        let line_nums   = self.prefs.line_numbers;
+        let rel_nums    = self.prefs.relative_numbers && line_nums;
+        let dark        = self.prefs.dark_mode;
+        let font_id     = FontId::new(font_size, self.editor_font_family());
+
+        // Gutter width sized to the digit count of the highest line number.
+        let total_lines = self.tabs[self.active_tab].content
+            .bytes().filter(|&b| b == b'\n').count() + 1;
+        let digits   = total_lines.to_string().len().max(2);
+        let gutter_w = if line_nums { font_size * 0.6 * digits as f32 + 18.0 } else { 0.0 };
+
+        let gutter_bg = if dark { Color32::from_rgb(28,28,34) } else { Color32::from_rgb(228,228,223) };
+        let divider   = if dark { Color32::from_rgb(46,46,56) } else { Color32::from_rgb(204,204,196) };
+        let num_color = Color32::from_rgb(110, 110, 130);
+        let cur_color = Color32::from_rgb(124, 106, 247);
+
+        let scroll = if word_wrap {
+            egui::ScrollArea::vertical()
+        } else {
+            egui::ScrollArea::both()
+        };
+
+        scroll
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let output = egui::TextEdit::multiline(&mut self.tabs[self.active_tab].content)
-                    .id(editor_id)
-                    .font(FontId::monospace(self.prefs.font_size))
-                    .desired_width(available.x)
-                    .desired_rows(1)
-                    .min_size(available)
-                    .frame(false)
-                    .lock_focus(true)
-                    .show(ui);
+                let fid = font_id.clone();
+                let mut layouter = move |ui: &egui::Ui, text: &str, wrap_width: f32| {
+                    let job = egui::text::LayoutJob::simple(
+                        text.to_owned(),
+                        fid.clone(),
+                        ui.visuals().text_color(),
+                        if word_wrap { wrap_width } else { f32::INFINITY },
+                    );
+                    ui.fonts(|f| f.layout_job(job))
+                };
+
+                let text_w = if word_wrap { (available.x - gutter_w).max(50.0) } else { f32::INFINITY };
+
+                let output = ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    if gutter_w > 0.0 { ui.add_space(gutter_w); }
+                    egui::TextEdit::multiline(&mut self.tabs[self.active_tab].content)
+                        .id(editor_id)
+                        .font(font_id.clone())
+                        .layouter(&mut layouter)
+                        .desired_width(text_w)
+                        .desired_rows(1)
+                        .min_size(Vec2::new((available.x - gutter_w).max(50.0), available.y))
+                        .frame(false)
+                        .lock_focus(true)
+                        .show(ui)
+                }).inner;
 
                 if output.response.changed() {
                     self.dirty = true;
                     self.last_edit_time = now;
                 }
+
+                // Track the live selection so the right-click menu can act on it.
+                // egui collapses the selection the instant the right mouse button is
+                // *pressed* (a frame before the menu opens), so we can't read it then.
+                // Instead we continuously remember the most recent non-empty selection
+                // and clear it only when the selection genuinely empties for a reason
+                // other than that right-press. On the right-press we also restore the
+                // visual highlight that egui just cleared.
+                let cur_sel = output.cursor_range.as_ref()
+                    .map(|cr| {
+                        let a = cr.primary.ccursor.index;
+                        let b = cr.secondary.ccursor.index;
+                        (a.min(b), a.max(b))
+                    })
+                    .filter(|&(a, b)| b > a)
+                    .or_else(|| self.editor_selection(ctx, editor_id).filter(|&(a, b)| b > a));
+                let sec_pressed = ctx.input(|i| i.pointer.secondary_pressed());
+                match cur_sel {
+                    Some(s)           => self.context_sel = Some(s),
+                    None if !sec_pressed => self.context_sel = None,
+                    None              => {}
+                }
+                if sec_pressed && output.response.hovered() {
+                    if let Some((a, b)) = self.context_sel {
+                        self.editor_set_cursor(ctx, editor_id, egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(a),
+                            egui::text::CCursor::new(b),
+                        ));
+                    }
+                }
+
+                // Right-click context menu for the editor.
+                let menu_sel = self.context_sel;
+                let has_sel  = menu_sel.map(|(a, b)| b > a).unwrap_or(false);
+                output.response.context_menu(|ui| {
+                    ui.add_enabled_ui(has_sel, |ui| {
+                        if ui.button("Cut").clicked()  { self.editor_cut(ctx, editor_id, menu_sel, now); ui.close_menu(); }
+                        if ui.button("Copy").clicked() { self.editor_copy(ctx, menu_sel);                ui.close_menu(); }
+                    });
+                    if ui.button("Paste").clicked()      { self.editor_paste(ctx, editor_id, menu_sel, now); ui.close_menu(); }
+                    ui.separator();
+                    if ui.button("Select All").clicked() { self.editor_select_all(ctx, editor_id); ui.close_menu(); }
+                    ui.separator();
+                    if ui.button("Undo").clicked()       { self.do_undo(ctx); ui.close_menu(); }
+                    if ui.button("Redo").clicked()       { self.do_redo(ctx); ui.close_menu(); }
+                });
 
                 if let Some(cursor) = output.cursor_range {
                     let text     = self.tabs[self.active_tab].content.as_str();
@@ -1544,6 +1902,55 @@ impl SecureNote {
                             );
                             painter.rect_filled(rect, 2.0, color);
                         }
+                    }
+                }
+
+                // Line-number gutter — painted on top of the text. Numbers are
+                // pinned to the left of the viewport (so horizontal scrolling never
+                // moves them) and aligned to each galley row, which keeps them
+                // correct even when a logical line wraps over several visual rows.
+                if line_nums {
+                    let clip    = ui.clip_rect();
+                    let origin  = output.galley_pos;
+                    let painter = ui.painter();
+
+                    let gutter_rect = egui::Rect::from_min_max(
+                        egui::pos2(clip.min.x, clip.min.y),
+                        egui::pos2(clip.min.x + gutter_w, clip.max.y),
+                    );
+                    painter.rect_filled(gutter_rect, 0.0, gutter_bg);
+                    painter.line_segment(
+                        [egui::pos2(clip.min.x + gutter_w, clip.min.y),
+                         egui::pos2(clip.min.x + gutter_w, clip.max.y)],
+                        Stroke::new(1.0, divider),
+                    );
+
+                    let num_font = FontId::monospace((font_size - 1.0).max(8.0));
+                    let cur      = self.cursor_line;
+                    let mut logical  = 0usize;
+                    let mut new_line = true;
+                    for row in &output.galley.rows {
+                        if new_line {
+                            let label = if rel_nums {
+                                if logical == cur {
+                                    (logical + 1).to_string()
+                                } else {
+                                    (logical as isize - cur as isize).unsigned_abs().to_string()
+                                }
+                            } else {
+                                (logical + 1).to_string()
+                            };
+                            let color = if logical == cur { cur_color } else { num_color };
+                            painter.text(
+                                egui::pos2(clip.min.x + gutter_w - 6.0, origin.y + row.rect.min.y),
+                                egui::Align2::RIGHT_TOP,
+                                label,
+                                num_font.clone(),
+                                color,
+                            );
+                        }
+                        new_line = row.ends_with_newline;
+                        if row.ends_with_newline { logical += 1; }
                     }
                 }
             });
@@ -1664,6 +2071,54 @@ impl SecureNote {
                                         let prev = self.prefs.clipboard_clear_delay;
                                         ui.add(egui::Slider::new(&mut self.prefs.clipboard_clear_delay, 10.0..=120.0).integer());
                                         if (self.prefs.clipboard_clear_delay - prev).abs() > f64::EPSILON { self.persist_prefs(); }
+                                    });
+                                }
+
+                                ui.add(egui::Separator::default());
+
+                                // Editor
+                                ui.label(RichText::new("EDITOR").size(10.0).strong().color(lc));
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Word wrap").size(11.0));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        let prev = self.prefs.word_wrap;
+                                        ui.checkbox(&mut self.prefs.word_wrap, "");
+                                        if self.prefs.word_wrap != prev { self.persist_prefs(); }
+                                    });
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Line numbers").size(11.0));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        let prev = self.prefs.line_numbers;
+                                        ui.checkbox(&mut self.prefs.line_numbers, "");
+                                        if self.prefs.line_numbers != prev { self.persist_prefs(); }
+                                    });
+                                });
+                                if self.prefs.line_numbers {
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("Relative numbers").size(11.0));
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            let prev = self.prefs.relative_numbers;
+                                            ui.checkbox(&mut self.prefs.relative_numbers, "");
+                                            if self.prefs.relative_numbers != prev { self.persist_prefs(); }
+                                        });
+                                    });
+                                }
+                                if EDITOR_FONTS.len() > 1 {
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("Font").size(11.0));
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            egui::ComboBox::from_id_source("editor_font")
+                                                .selected_text(self.prefs.editor_font.clone())
+                                                .show_ui(ui, |ui| {
+                                                    for (name, _) in EDITOR_FONTS {
+                                                        if ui.selectable_label(self.prefs.editor_font == *name, *name).clicked() {
+                                                            self.prefs.editor_font = (*name).to_string();
+                                                            self.persist_prefs();
+                                                        }
+                                                    }
+                                                });
+                                        });
                                     });
                                 }
 

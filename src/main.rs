@@ -14,6 +14,7 @@
 
 mod app;
 mod crypto;
+mod markdown;
 mod storage;
 
 use app::SecureNote;

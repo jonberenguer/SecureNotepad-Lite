@@ -7,6 +7,7 @@ use std::{fs, path::PathBuf};
 fn default_true() -> bool { true }
 fn default_auto_lock_delay() -> f64 { 5.0 }
 fn default_clipboard_clear_delay() -> f64 { 30.0 }
+fn default_editor_font() -> String { "Monospace".to_string() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Prefs {
@@ -22,6 +23,21 @@ pub struct Prefs {
     pub clipboard_clear:       bool,
     #[serde(default = "default_clipboard_clear_delay")]
     pub clipboard_clear_delay: f64,
+    /// Whether the Markdown live-preview pane is shown.
+    #[serde(default)]
+    pub preview_open: bool,
+    /// Wrap long lines to the editor width (vs. horizontal scrolling).
+    #[serde(default = "default_true")]
+    pub word_wrap: bool,
+    /// Show a line-number gutter in the editor.
+    #[serde(default)]
+    pub line_numbers: bool,
+    /// Show line numbers relative to the cursor line (vim-style).
+    #[serde(default)]
+    pub relative_numbers: bool,
+    /// Editor font family name (must match a registered family).
+    #[serde(default = "default_editor_font")]
+    pub editor_font: String,
     pub win_x: Option<f32>,
     pub win_y: Option<f32>,
     pub win_w: Option<f32>,
@@ -39,6 +55,11 @@ impl Default for Prefs {
             auto_lock_delay:       5.0,
             clipboard_clear:       true,
             clipboard_clear_delay: 30.0,
+            preview_open:          false,
+            word_wrap:             true,
+            line_numbers:          false,
+            relative_numbers:      false,
+            editor_font:           default_editor_font(),
             win_x: None, win_y: None,
             win_w: None, win_h: None,
         }
