@@ -16,6 +16,7 @@ mod app;
 mod crypto;
 mod markdown;
 mod storage;
+mod vim;
 
 use app::SecureNote;
 use clap::Parser;

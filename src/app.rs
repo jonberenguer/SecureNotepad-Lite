@@ -1,5 +1,6 @@
 use crate::crypto::{hash_password, verify_password};
 use crate::markdown;
+use crate::vim::{self, Mode, Vim};
 use crate::storage::{
     Prefs, Tab,
     default_tabs, load_config, load_prefs, load_tabs,
@@ -194,6 +195,9 @@ pub struct SecureNote {
     // doesn't lose the highlighted range the menu operates on.
     context_sel: Option<(usize, usize)>,
 
+    // Vim mode state (only active when prefs.vim_mode is enabled).
+    vim: Vim,
+
     // Per-tab undo/redo history keyed by tab.id
     undo_stacks:      HashMap<u32, Vec<String>>,
     undo_positions:   HashMap<u32, usize>,
@@ -256,6 +260,7 @@ impl SecureNote {
             tab_scroll_offset:  0.0,
             tab_overflow:       false,
             context_sel:        None,
+            vim:                Vim::default(),
             undo_stacks:        HashMap::new(),
             undo_positions:     HashMap::new(),
             undo_last_snap:     0.0,
@@ -384,6 +389,11 @@ impl SecureNote {
         self.dirty              = false;
         self.last_activity_time = ctx.input(|i| i.time);
         self.apply_theme(ctx);
+        // Start in Vim Normal mode with the editor focused so keys are captured.
+        self.vim.reset_to_normal();
+        if self.prefs.vim_mode {
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("editor")));
+        }
     }
 
     fn add_tab(&mut self) {
@@ -792,6 +802,182 @@ impl SecureNote {
             Some((_, fam)) if !fam.is_empty() => FontFamily::Name((*fam).into()),
             _ => FontFamily::Monospace,
         }
+    }
+
+    // ── Vim mode ────────────────────────────────────────────────────────────────
+
+    fn vim_cursor_index(&self, ctx: &egui::Context, editor_id: egui::Id) -> usize {
+        egui::text_edit::TextEditState::load(ctx, editor_id)
+            .and_then(|s| s.cursor.char_range())
+            .map(|r| r.primary.index)
+            .unwrap_or(0)
+    }
+
+    fn vim_set_cursor(&self, ctx: &egui::Context, editor_id: egui::Id, idx: usize) {
+        self.editor_set_cursor(ctx, editor_id,
+            egui::text::CCursorRange::one(egui::text::CCursor::new(idx)));
+    }
+
+    /// Drive Vim mode for this frame. Called before the TextEdit is shown, only
+    /// when Vim is enabled and the editor holds keyboard focus.
+    fn vim_step(&mut self, ctx: &egui::Context, editor_id: egui::Id, now: f64) {
+        match self.vim.mode {
+            Mode::Insert => {
+                // Esc leaves Insert mode, nudging the cursor left one column (Vim).
+                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, EKey::Escape)) {
+                    let idx  = self.vim_cursor_index(ctx, editor_id);
+                    let text: Vec<char> = self.tabs[self.active_tab].content.chars().collect();
+                    let ni = vim::left(&text, idx);
+                    self.vim_set_cursor(ctx, editor_id, vim::clamp_normal(&text, ni));
+                    // Snapshot the inserted text as one undo unit.
+                    let id = self.tabs[self.active_tab].id;
+                    self.push_undo_snap(id, self.tabs[self.active_tab].content.clone());
+                    self.vim.reset_to_normal();
+                }
+            }
+            Mode::Normal => self.vim_normal_input(ctx, editor_id, now),
+        }
+    }
+
+    fn vim_normal_input(&mut self, ctx: &egui::Context, editor_id: egui::Id, now: f64) {
+        // Ctrl-r → redo (Vim), before the generic key strip below.
+        if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, EKey::R)) {
+            self.do_redo(ctx);
+        }
+
+        // Collect this frame's typed characters and whether Escape was pressed.
+        let mut typed: Vec<char> = Vec::new();
+        let mut escape = false;
+        ctx.input(|i| {
+            for ev in &i.events {
+                match ev {
+                    egui::Event::Text(t) => typed.extend(t.chars()),
+                    egui::Event::Key { key: EKey::Escape, pressed: true, .. } => escape = true,
+                    _ => {}
+                }
+            }
+        });
+        if escape {
+            self.vim.pending_g = false;
+        }
+        for c in typed {
+            self.vim_normal_char(c, ctx, editor_id, now);
+        }
+
+        // Starve the TextEdit of key/text input so Normal-mode keys never insert.
+        ctx.input_mut(|i| i.events.retain(|e|
+            !matches!(e, egui::Event::Text(_) | egui::Event::Key { .. })));
+    }
+
+    fn vim_normal_char(&mut self, c: char, ctx: &egui::Context, editor_id: egui::Id, now: f64) {
+        let text: Vec<char> = self.tabs[self.active_tab].content.chars().collect();
+        let i = self.vim_cursor_index(ctx, editor_id).min(text.len());
+
+        // Second key of a `g` sequence.
+        if self.vim.pending_g {
+            self.vim.pending_g = false;
+            if c == 'g' {
+                let ni = vim::clamp_normal(&text, vim::buffer_top(&text));
+                self.vim_set_cursor(ctx, editor_id, ni);
+                self.vim.want_col = None;
+            }
+            return;
+        }
+
+        // Pure cursor motions.
+        let motion: Option<usize> = match c {
+            'h' => Some(vim::left(&text, i)),
+            'l' => Some(vim::right(&text, i)),
+            '0' => Some(vim::line_start(&text, i)),
+            '^' => Some(vim::first_non_blank(&text, i)),
+            '$' => Some(vim::line_last(&text, i)),
+            'w' => Some(vim::clamp_normal(&text, vim::word_forward(&text, i))),
+            'b' => Some(vim::clamp_normal(&text, vim::word_backward(&text, i))),
+            'e' => Some(vim::clamp_normal(&text, vim::word_end(&text, i))),
+            'G' => Some(vim::clamp_normal(&text, vim::buffer_bottom(&text))),
+            'j' => {
+                let wc = self.vim.want_col.unwrap_or_else(|| vim::col(&text, i));
+                self.vim.want_col = Some(wc);
+                Some(vim::down(&text, i, wc))
+            }
+            'k' => {
+                let wc = self.vim.want_col.unwrap_or_else(|| vim::col(&text, i));
+                self.vim.want_col = Some(wc);
+                Some(vim::up(&text, i, wc))
+            }
+            _ => None,
+        };
+        if let Some(ni) = motion {
+            if !matches!(c, 'j' | 'k') {
+                self.vim.want_col = None;
+            }
+            self.vim_set_cursor(ctx, editor_id, ni);
+            return;
+        }
+
+        match c {
+            'g' => self.vim.pending_g = true,
+            'u' => self.do_undo(ctx),
+
+            // Enter Insert mode.
+            'i' => self.vim.mode = Mode::Insert,
+            'a' => {
+                let ni = (i + 1).min(vim::line_end(&text, i));
+                self.vim_set_cursor(ctx, editor_id, ni);
+                self.vim.mode = Mode::Insert;
+            }
+            'I' => {
+                let ni = vim::first_non_blank(&text, i);
+                self.vim_set_cursor(ctx, editor_id, ni);
+                self.vim.mode = Mode::Insert;
+            }
+            'A' => {
+                let ni = vim::line_end(&text, i);
+                self.vim_set_cursor(ctx, editor_id, ni);
+                self.vim.mode = Mode::Insert;
+            }
+
+            // Editing commands (each a single undo step).
+            'x' => {
+                let last = vim::line_last(&text, i);
+                if i < text.len() && text[i] != '\n' {
+                    let id = self.tabs[self.active_tab].id;
+                    self.push_undo_snap(id, self.tabs[self.active_tab].content.clone());
+                    let content = &mut self.tabs[self.active_tab].content;
+                    let ba = char_to_byte(content, i);
+                    let bb = char_to_byte(content, i + 1);
+                    content.replace_range(ba..bb, "");
+                    self.push_undo_snap(id, self.tabs[self.active_tab].content.clone());
+                    self.dirty = true;
+                    self.last_edit_time = now;
+                    let text2: Vec<char> = self.tabs[self.active_tab].content.chars().collect();
+                    self.vim_set_cursor(ctx, editor_id, vim::clamp_normal(&text2, i.min(last)));
+                }
+            }
+            'o' => self.vim_open_line(ctx, editor_id, now, true),
+            'O' => self.vim_open_line(ctx, editor_id, now, false),
+            _ => {}
+        }
+    }
+
+    /// `o` / `O`: open a new line below/above and enter Insert mode.
+    fn vim_open_line(&mut self, ctx: &egui::Context, editor_id: egui::Id, now: f64, below: bool) {
+        let text: Vec<char> = self.tabs[self.active_tab].content.chars().collect();
+        let i = self.vim_cursor_index(ctx, editor_id).min(text.len());
+        let insert_at = if below { vim::line_end(&text, i) } else { vim::line_start(&text, i) };
+
+        let id = self.tabs[self.active_tab].id;
+        self.push_undo_snap(id, self.tabs[self.active_tab].content.clone());
+        let content = &mut self.tabs[self.active_tab].content;
+        let byte = char_to_byte(content, insert_at);
+        content.insert(byte, '\n');
+        self.dirty = true;
+        self.last_edit_time = now;
+
+        let cursor = if below { insert_at + 1 } else { insert_at };
+        self.vim_set_cursor(ctx, editor_id, cursor);
+        self.vim.mode = Mode::Insert;
+        self.vim.want_col = None;
     }
 }
 
@@ -1489,6 +1675,15 @@ impl SecureNote {
                 .inner_margin(egui::Margin::symmetric(14.0, 4.0)))
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
+                    if self.prefs.vim_mode {
+                        let mc = match self.vim.mode {
+                            Mode::Normal => Color32::from_rgb(124, 106, 247),
+                            Mode::Insert => Color32::from_rgb(92, 224, 138),
+                        };
+                        ui.label(RichText::new(self.vim.mode.label())
+                            .size(11.0).strong().monospace().color(mc));
+                        ui.separator();
+                    }
                     ui.label(RichText::new("Ln ").size(11.0).monospace().color(dim));
                     ui.label(RichText::new((self.cursor_line + 1).to_string()).size(11.0).monospace().color(val));
                     ui.label(RichText::new("  Col ").size(11.0).monospace().color(dim));
@@ -1742,6 +1937,17 @@ impl SecureNote {
 
         let editor_id = egui::Id::new("editor");
 
+        // Vim: drive the mode machine and (in Normal mode) strip key events
+        // *before* the TextEdit runs, so keystrokes navigate instead of inserting.
+        // Gated on editor focus (so other text fields are untouched) and on no
+        // modal being open.
+        let editor_focused = ctx.memory(|m| m.has_focus(editor_id));
+        let vim_engaged = self.prefs.vim_mode && editor_focused && self.modal == Modal::None;
+        if vim_engaged {
+            self.vim_step(ctx, editor_id, now);
+        }
+        let vim_normal_active = vim_engaged && self.vim.mode == Mode::Normal;
+
         let font_size   = self.prefs.font_size;
         let word_wrap   = self.prefs.word_wrap;
         let line_nums   = self.prefs.line_numbers;
@@ -1809,26 +2015,33 @@ impl SecureNote {
                 // and clear it only when the selection genuinely empties for a reason
                 // other than that right-press. On the right-press we also restore the
                 // visual highlight that egui just cleared.
-                let cur_sel = output.cursor_range.as_ref()
-                    .map(|cr| {
-                        let a = cr.primary.ccursor.index;
-                        let b = cr.secondary.ccursor.index;
-                        (a.min(b), a.max(b))
-                    })
-                    .filter(|&(a, b)| b > a)
-                    .or_else(|| self.editor_selection(ctx, editor_id).filter(|&(a, b)| b > a));
-                let sec_pressed = ctx.input(|i| i.pointer.secondary_pressed());
-                match cur_sel {
-                    Some(s)           => self.context_sel = Some(s),
-                    None if !sec_pressed => self.context_sel = None,
-                    None              => {}
-                }
-                if sec_pressed && output.response.hovered() {
-                    if let Some((a, b)) = self.context_sel {
-                        self.editor_set_cursor(ctx, editor_id, egui::text::CCursorRange::two(
-                            egui::text::CCursor::new(a),
-                            egui::text::CCursor::new(b),
-                        ));
+                //
+                // In Vim Normal mode, Vim owns the selection/cursor, so this tracker
+                // is bypassed to avoid the two systems fighting.
+                if vim_normal_active {
+                    self.context_sel = None;
+                } else {
+                    let cur_sel = output.cursor_range.as_ref()
+                        .map(|cr| {
+                            let a = cr.primary.ccursor.index;
+                            let b = cr.secondary.ccursor.index;
+                            (a.min(b), a.max(b))
+                        })
+                        .filter(|&(a, b)| b > a)
+                        .or_else(|| self.editor_selection(ctx, editor_id).filter(|&(a, b)| b > a));
+                    let sec_pressed = ctx.input(|i| i.pointer.secondary_pressed());
+                    match cur_sel {
+                        Some(s)              => self.context_sel = Some(s),
+                        None if !sec_pressed => self.context_sel = None,
+                        None                 => {}
+                    }
+                    if sec_pressed && output.response.hovered() {
+                        if let Some((a, b)) = self.context_sel {
+                            self.editor_set_cursor(ctx, editor_id, egui::text::CCursorRange::two(
+                                egui::text::CCursor::new(a),
+                                egui::text::CCursor::new(b),
+                            ));
+                        }
                     }
                 }
 
@@ -1959,6 +2172,23 @@ impl SecureNote {
                         if row.ends_with_newline { logical += 1; }
                     }
                 }
+
+                // Vim Normal-mode block cursor, painted over the character the
+                // cursor sits on (using the galley, like the search highlights).
+                if vim_normal_active {
+                    if let Some(cr) = output.cursor_range.as_ref() {
+                        let idx  = cr.primary.ccursor.index;
+                        let cc   = output.galley.from_ccursor(egui::text::CCursor::new(idx));
+                        let rect = output.galley.pos_from_cursor(&cc);
+                        let w    = font_size * 0.6;
+                        let min  = output.galley_pos + rect.min.to_vec2();
+                        let block = egui::Rect::from_min_size(min, egui::vec2(w, rect.height()));
+                        ui.painter().rect_filled(
+                            block, 1.0,
+                            Color32::from_rgba_unmultiplied(124, 106, 247, 110),
+                        );
+                    }
+                }
             });
 
         // Tell egui's Focus::begin_frame that this widget owns Escape.  begin_frame
@@ -2084,6 +2314,20 @@ impl SecureNote {
 
                                 // Editor
                                 ui.label(RichText::new("EDITOR").size(10.0).strong().color(lc));
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Vim mode").size(11.0));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        let prev = self.prefs.vim_mode;
+                                        ui.checkbox(&mut self.prefs.vim_mode, "");
+                                        if self.prefs.vim_mode != prev {
+                                            self.persist_prefs();
+                                            self.vim.reset_to_normal();
+                                            if self.prefs.vim_mode {
+                                                ctx.memory_mut(|m| m.request_focus(egui::Id::new("editor")));
+                                            }
+                                        }
+                                    });
+                                });
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new("Word wrap").size(11.0));
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
