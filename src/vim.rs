@@ -18,6 +18,7 @@ pub enum Mode {
     Insert,
     Visual,
     VisualLine,
+    VisualBlock,
 }
 
 impl Mode {
@@ -27,11 +28,24 @@ impl Mode {
             Mode::Insert => "INSERT",
             Mode::Visual => "VISUAL",
             Mode::VisualLine => "V-LINE",
+            Mode::VisualBlock => "V-BLOCK",
         }
     }
     pub fn is_visual(self) -> bool {
-        matches!(self, Mode::Visual | Mode::VisualLine)
+        matches!(self, Mode::Visual | Mode::VisualLine | Mode::VisualBlock)
     }
+}
+
+/// Active block-insert (`I`/`A`/`c` in Visual-Block): the text typed on the top
+/// line is replicated to the other rows at `col` when Insert is left.
+#[derive(Default, Clone)]
+pub struct BlockInsert {
+    /// Row numbers (0-based) to replicate the typed text to (excludes the top row).
+    pub rows: Vec<usize>,
+    /// Target column.
+    pub col: usize,
+    /// Char index where the insert began on the top row.
+    pub start: usize,
 }
 
 /// Pending operator awaiting a motion (`d`/`c`/`y`), carrying its count.
@@ -54,6 +68,18 @@ pub enum FindKind {
     Back,     // F
     Till,     // t
     TillBack, // T
+}
+
+impl FindKind {
+    /// The opposite direction (for `,`).
+    pub fn reversed(self) -> FindKind {
+        match self {
+            FindKind::Forward => FindKind::Back,
+            FindKind::Back => FindKind::Forward,
+            FindKind::Till => FindKind::TillBack,
+            FindKind::TillBack => FindKind::Till,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -97,6 +123,8 @@ pub struct Vim {
     pub pending_find: Option<FindKind>,
     /// `r` awaiting a replacement character.
     pub pending_replace: bool,
+    /// Last `f`/`F`/`t`/`T` for `;` / `,` repeat.
+    pub last_find: Option<(FindKind, char)>,
     /// Visual-mode anchor (the fixed end of the selection).
     pub visual_anchor: usize,
     /// Visual-mode moving cursor (the end that motions move).
@@ -115,6 +143,8 @@ pub struct Vim {
     pub search_active: bool,
     /// Direction of the last search (for `n`/`N`).
     pub search_forward: bool,
+    /// Pending block-insert to apply on leaving Insert mode.
+    pub block_insert: Option<BlockInsert>,
 }
 
 impl Vim {
@@ -128,6 +158,7 @@ impl Vim {
         self.pending_op = None;
         self.pending_find = None;
         self.pending_replace = false;
+        self.block_insert = None;
     }
 
     /// Consume the pending count (default 1).
@@ -242,7 +273,7 @@ pub fn down(s: &[char], i: usize, want_col: usize) -> usize {
     let nstart = end + 1;
     let nend = line_end(s, nstart);
     let nlast = if nend > nstart { nend - 1 } else { nstart };
-    (nstart + want_col).min(nlast)
+    nstart.saturating_add(want_col).min(nlast)
 }
 
 pub fn up(s: &[char], i: usize, want_col: usize) -> usize {
@@ -253,7 +284,7 @@ pub fn up(s: &[char], i: usize, want_col: usize) -> usize {
     let pstart = line_start(s, start - 1);
     let pend = start - 1; // the '\n' ending the previous line
     let plast = if pend > pstart { pend - 1 } else { pstart };
-    (pstart + want_col).min(plast)
+    pstart.saturating_add(want_col).min(plast)
 }
 
 pub fn word_forward(s: &[char], i: usize) -> usize {

@@ -1,12 +1,14 @@
 # Vim Mode
 
-An opt-in, toggleable Vim editing mode for the editor. Enable it in
-**Preferences → EDITOR → Vim mode** (persisted). When disabled, the editor
-behaves exactly as it does without Vim mode.
+An opt-in, toggleable Vim editing mode for the editor. Toggle it from the
+**Vim** button in the toolbar or in **Preferences → EDITOR → Vim mode**
+(persisted). When disabled, the editor behaves exactly as it does without Vim
+mode.
 
 The current mode is shown at the left of the status bar
-(`NORMAL` / `INSERT` / `VISUAL` / `V-LINE`). In Normal mode a block cursor is
-drawn over the character under the cursor.
+(`NORMAL` / `INSERT` / `VISUAL` / `V-LINE` / `V-BLOCK`). In Normal mode a block
+cursor is drawn over the character under the cursor. The pending (partial)
+command — the Vim `showcmd` — is shown near the right of the status bar.
 
 Yanks and deletes use an **internal register** and are deliberately kept **off
 the OS clipboard**, consistent with the app's clipboard-auto-clear security
@@ -21,18 +23,20 @@ feature.
 |---|---|
 | `i` `a` `I` `A` | Insert before / after cursor / line start / line end |
 | `o` `O` | Open line below / above and insert |
-| `v` `V` | Visual (charwise) / Visual-Line |
+| `v` `V` `Ctrl-v` | Visual (charwise) / Visual-Line / Visual-Block |
 | `Esc` | Return to Normal (from Insert or Visual) |
 
 ### Motions (count-aware, e.g. `5j`, `3w`)
 | Key | Motion |
 |---|---|
-| `h` `j` `k` `l` | Left / down / up / right (`j`/`k` keep the column) |
+| `h` `j` `k` `l` | Left / down / up / right (`j`/`k` keep the column; sticky after `$`) |
+| `←` `↓` `↑` `→` | Arrow keys also navigate in Normal / Visual mode |
 | `0` `^` `$` | Line start / first non-blank / line end |
 | `w` `b` `e` | Word forward / back / end |
 | `{` `}` | Paragraph back / forward |
-| `gg` `G` | First / last line |
+| `gg` `G` | First / last line; `{count}gg` / `{count}G` jump to line N |
 | `f` `F` `t` `T` {char} | Find char forward/back, till forward/back (on the line) |
+| `;` `,` | Repeat last `f`/`t` in same / opposite direction |
 
 ### Operators & edits
 | Key | Action |
@@ -49,6 +53,11 @@ feature.
 ### Visual mode
 Motions extend the selection; `d` `x` `c` `s` `y` operate on it, then return to
 Normal. `Esc` collapses the selection.
+
+**Visual-Block** (`Ctrl-v`) selects a rectangle:
+- `d` / `x` delete the block, `y` yank it, `c` / `s` change it.
+- `I` / `A` insert / append on every row — text typed on the top row is
+  replicated to the other rows when you press `Esc`.
 
 ### Search & Ex commands
 | Command | Action |
@@ -72,15 +81,14 @@ Tier 2), recorded so behaviour is predictable. Items marked *(Tier 3)* are
 planned future work.
 
 ### Editing / undo
-- **Change is not a single undo step.** `cw` + typing + `Esc` currently takes
-  **two** `u` presses to fully revert (the delete and the inserted text are
-  separate undo snapshots). Vim collapses this into one.
-- **Insert edits may split across undo steps.** A long insert can be broken into
-  multiple undo snapshots by the app's time-based auto-snapshot, so `u` may not
-  rewind the entire insert at once.
 - **Undo does not restore the exact cursor position.** After `u` / `Ctrl-r` the
   caret is clamped to a valid position rather than moved back to where the edit
   occurred.
+
+> Change/insert commands (`cw`, `cc`, `s`, `o`, `i`, …) now collapse into a
+> **single** undo step: entering Insert snapshots the buffer once and `Esc`
+> snapshots it again, and the time-based auto-snapshot is suppressed while
+> inserting.
 
 ### Motions
 - **Word motions are simplified.** `w` / `b` / `e` use a basic
@@ -88,11 +96,6 @@ planned future work.
   `W` / `B` / `E` (WORD) motions.
 - **Paragraph motions are approximate.** `{` / `}` are based on blank lines and
   do not implement Vim's full paragraph rules.
-- **No `;` / `,`** to repeat the last `f` / `t`.
-- **No sticky end-of-line column.** After `$`, moving with `j` / `k` does not
-  keep the cursor at line end.
-- **`{count}G` / `{count}gg` not supported** — `G` goes to the last line and `gg`
-  to the first regardless of count. *(Tier 3)*
 
 ### Registers / clipboard
 - **Single unnamed register only.** No named registers (`"a`) and no macros
@@ -108,8 +111,9 @@ planned future work.
   split naively on `/`.
 - **`:s` flags:** only `g` (global on the line) is supported. No `c`
   (confirm), inline `i`, count, etc.
-- **Highlights can go stale after edits.** Match positions are not recomputed
-  when the buffer changes; re-run the search (`/`) to refresh.
+- **Search highlight clears when you edit the buffer.** Rather than showing stale
+  match positions, the highlight is dropped on any edit; re-run the search (`/`)
+  to show matches again.
 - **No incremental search or search history.** Matching happens on `Enter`, and
   previous patterns are not recalled.
 - **`:q` saves before locking** (safer for a notes app than Vim's discard-by-
@@ -120,10 +124,16 @@ planned future work.
   `Ctrl-u`, `Ctrl-r{reg}`, …) are not implemented; Insert behaves like the normal
   editor.
 
+### Visual-Block
+- **Block yank/paste is not a true block.** A yanked block is stored as its rows
+  joined by newlines and pastes back as plain text, not re-inserted as a column.
+- **Block `I`/`A` replicate simple text only.** The text typed on the top row is
+  copied to the other rows on `Esc`; if you type a newline or move off the top
+  row during the insert, replication is skipped. `A` does not pad short lines.
+
 ### Not yet implemented *(Tier 3)*
 - `.` (repeat last change)
 - Text objects (`ciw`, `di"`, `ca(` …)
-- Visual-block mode (`Ctrl-v`)
 - Marks (`m` / `` ` ``), jumps
 - `>>` / `<<` indentation, `J` join, `~` / `gu` / `gU` case operators
 

@@ -835,31 +835,63 @@ impl SecureNote {
         }
     }
 
-    /// Delete a character range `[start, end)` as one undo step.
-    fn vim_delete_range(&mut self, start: usize, end: usize, now: f64) {
+    /// Edit-side effects shared by every Vim buffer mutation: mark dirty, bump the
+    /// edit clock, and drop any (now stale) search highlight.
+    fn vim_after_edit(&mut self, now: f64) {
+        self.dirty = true;
+        self.last_edit_time = now;
+        self.vim.search_active = false;
+    }
+
+    /// Delete `[start, end)` without touching the undo stack.
+    fn vim_delete_raw(&mut self, start: usize, end: usize, now: f64) {
         if end <= start { return; }
-        let id = self.tabs[self.active_tab].id;
-        self.push_undo_snap(id, self.tabs[self.active_tab].content.clone());
         let content = &mut self.tabs[self.active_tab].content;
         let ba = char_to_byte(content, start);
         let bb = char_to_byte(content, end);
         content.replace_range(ba..bb, "");
+        self.vim_after_edit(now);
+    }
+
+    /// Insert `s` at a character position without touching the undo stack.
+    fn vim_insert_raw(&mut self, at: usize, s: &str, now: f64) {
+        if s.is_empty() { return; }
+        let content = &mut self.tabs[self.active_tab].content;
+        let byte = char_to_byte(content, at);
+        content.insert_str(byte, s);
+        self.vim_after_edit(now);
+    }
+
+    /// Snapshot the current buffer so the next edit starts a fresh undo step.
+    fn vim_snapshot(&mut self) {
+        let id = self.tabs[self.active_tab].id;
         self.push_undo_snap(id, self.tabs[self.active_tab].content.clone());
-        self.dirty = true;
-        self.last_edit_time = now;
+    }
+
+    /// Delete a character range `[start, end)` as one undo step.
+    fn vim_delete_range(&mut self, start: usize, end: usize, now: f64) {
+        if end <= start { return; }
+        self.vim_snapshot();
+        self.vim_delete_raw(start, end, now);
+        self.vim_snapshot();
     }
 
     /// Insert text at a character position as one undo step.
     fn vim_insert_text(&mut self, at: usize, s: &str, now: f64) {
         if s.is_empty() { return; }
-        let id = self.tabs[self.active_tab].id;
-        self.push_undo_snap(id, self.tabs[self.active_tab].content.clone());
-        let content = &mut self.tabs[self.active_tab].content;
-        let byte = char_to_byte(content, at);
-        content.insert_str(byte, s);
-        self.push_undo_snap(id, self.tabs[self.active_tab].content.clone());
-        self.dirty = true;
-        self.last_edit_time = now;
+        self.vim_snapshot();
+        self.vim_insert_raw(at, s, now);
+        self.vim_snapshot();
+    }
+
+    /// Begin a Vim insert session: snapshot the pre-insert buffer once so the
+    /// whole command + typing + `Esc` collapses into a single undo step (the
+    /// matching post snapshot is pushed on `Esc`). Any buffer edit that is part
+    /// of the command (e.g. the delete of `cw`) must be done *after* this via the
+    /// `_raw` helpers so no intermediate snapshot is recorded.
+    fn vim_begin_insert(&mut self) {
+        self.vim_snapshot();
+        self.vim.mode = Mode::Insert;
     }
 
     /// Drive Vim mode for this frame. Called before the TextEdit is shown, only
@@ -869,6 +901,10 @@ impl SecureNote {
             Mode::Insert => {
                 // Esc leaves Insert mode, nudging the cursor left one column (Vim).
                 if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, EKey::Escape)) {
+                    // Apply a pending block-insert to the other rows first.
+                    if self.vim.block_insert.is_some() {
+                        self.vim_apply_block_insert(ctx, editor_id, now);
+                    }
                     let idx  = self.vim_cursor_index(ctx, editor_id);
                     let text = self.vim_chars();
                     let ni = vim::left(&text, idx);
@@ -880,9 +916,15 @@ impl SecureNote {
             }
             _ => self.vim_active_input(ctx, editor_id, now),
         }
-        // Reflect the Visual selection in the egui caret/selection for highlight.
-        if self.vim.mode.is_visual() {
-            self.vim_sync_visual_selection(ctx, editor_id);
+        // Reflect the Visual selection for highlighting.
+        match self.vim.mode {
+            Mode::Visual | Mode::VisualLine => self.vim_sync_visual_selection(ctx, editor_id),
+            // Block selection is painted manually; keep the egui caret at the cursor.
+            Mode::VisualBlock => {
+                let vc = self.vim.vcursor;
+                self.vim_set_cursor(ctx, editor_id, vc);
+            }
+            _ => {}
         }
     }
 
@@ -892,14 +934,33 @@ impl SecureNote {
         if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, EKey::R)) {
             self.do_redo(ctx);
         }
+        // Ctrl-V toggles Visual-Block mode. Most platforms turn Ctrl/Cmd+V into a
+        // Paste *event* (not a Key event), so detect either; the Paste event is
+        // stripped below so nothing is pasted.
+        let ctrl_v = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))));
+        let key_v  = ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, EKey::V));
+        if ctrl_v || key_v {
+            let text = self.vim_chars();
+            let cursor = self.vim_cursor(ctx, editor_id, text.len());
+            self.vim_toggle_visual(Mode::VisualBlock, cursor);
+        }
 
-        let mut typed: Vec<char> = Vec::new();
+        // Collect this frame's commands from typed characters and arrow keys
+        // (arrows navigate in Normal/Visual like h/j/k/l), in event order.
+        let mut cmds: Vec<char> = Vec::new();
         let mut escape = false;
         ctx.input(|i| {
             for ev in &i.events {
                 match ev {
-                    egui::Event::Text(t) => typed.extend(t.chars()),
-                    egui::Event::Key { key: EKey::Escape, pressed: true, .. } => escape = true,
+                    egui::Event::Text(t) => cmds.extend(t.chars()),
+                    egui::Event::Key { key, pressed: true, .. } => match key {
+                        EKey::Escape     => escape = true,
+                        EKey::ArrowLeft  => cmds.push('h'),
+                        EKey::ArrowRight => cmds.push('l'),
+                        EKey::ArrowUp    => cmds.push('k'),
+                        EKey::ArrowDown  => cmds.push('j'),
+                        _ => {}
+                    },
                     _ => {}
                 }
             }
@@ -913,13 +974,16 @@ impl SecureNote {
             }
             self.vim.reset_to_normal();
         } else {
-            for c in typed {
+            for c in cmds {
                 self.vim_key(c, ctx, editor_id, now);
             }
         }
 
-        ctx.input_mut(|i| i.events.retain(|e|
-            !matches!(e, egui::Event::Text(_) | egui::Event::Key { .. })));
+        // Starve the TextEdit of key/text *and clipboard* events so Normal-mode
+        // keys never insert and Ctrl+V/Ctrl+C/Ctrl+X don't paste/copy/cut.
+        ctx.input_mut(|i| i.events.retain(|e| !matches!(e,
+            egui::Event::Text(_) | egui::Event::Key { .. }
+            | egui::Event::Paste(_) | egui::Event::Copy | egui::Event::Cut)));
     }
 
     /// The main Normal/Visual keystroke dispatcher.
@@ -946,6 +1010,7 @@ impl SecureNote {
         // `f`/`F`/`t`/`T` awaiting a target character.
         if let Some(kind) = self.vim.pending_find.take() {
             let n = self.vim.take_count();
+            self.vim.last_find = Some((kind, c));
             if let Some(target) = vim::find_in_line(&text, cursor, kind, c, n) {
                 let mk = match kind {
                     vim::FindKind::Forward | vim::FindKind::Till => vim::MotionKind::Inclusive,
@@ -965,13 +1030,17 @@ impl SecureNote {
             return;
         }
 
-        // `g` prefix (gg).
+        // `g` prefix (gg / {count}gg).
         if self.vim.pending_g {
             self.vim.pending_g = false;
-            self.vim.count = None;
             if c == 'g' {
-                let target = vim::buffer_top(&text);
+                let target = match self.vim.count.take() {
+                    Some(nn) => self.vim_nth_line_fnb(&text, nn),
+                    None => vim::buffer_top(&text),
+                };
                 self.vim_move_or_op(&text, cursor, target, vim::MotionKind::Linewise, ctx, editor_id, now);
+            } else {
+                self.vim.count = None;
             }
             return;
         }
@@ -1034,12 +1103,26 @@ impl SecureNote {
             return;
         }
 
-        // Other counted motions (h l w b e 0 ^ $ { } G).
+        // `G` with an explicit count jumps to that line (else the last line).
+        if c == 'G' {
+            let target = match self.vim.count.take() {
+                Some(nn) => self.vim_nth_line_fnb(&text, nn),
+                None => vim::buffer_bottom(&text),
+            };
+            self.vim_move_or_op(&text, cursor, target, vim::MotionKind::Linewise, ctx, editor_id, now);
+            return;
+        }
+
+        // Other counted motions (h l w b e 0 ^ $ { }).
         let mc = self.vim.count.unwrap_or(1).max(1);
         let total = self.vim.pending_op.map_or(mc, |p| p.count.saturating_mul(mc));
         if let Some((target, kind)) = self.vim_resolve_motion(c, &text, cursor, total) {
             self.vim.count = None;
             self.vim_move_or_op(&text, cursor, target, kind, ctx, editor_id, now);
+            // `$` makes vertical motion stick to the end of the line.
+            if c == '$' {
+                self.vim.want_col = Some(usize::MAX);
+            }
             return;
         }
 
@@ -1048,6 +1131,15 @@ impl SecureNote {
             self.vim.pending_op = None;
             self.vim.count = None;
             return;
+        }
+
+        // Visual-Block: `I`/`A` begin block insert on the top row.
+        if self.vim.mode == Mode::VisualBlock {
+            match c {
+                'I' => { self.vim_block_insert_enter(false, ctx, editor_id, now); return; }
+                'A' => { self.vim_block_insert_enter(true, ctx, editor_id, now); return; }
+                _ => {}
+            }
         }
 
         // In Visual mode, `x`/`s` act on the selection like `d`/`c`.
@@ -1063,21 +1155,21 @@ impl SecureNote {
         match c {
             'v' => self.vim_toggle_visual(Mode::Visual, cursor),
             'V' => self.vim_toggle_visual(Mode::VisualLine, cursor),
-            'i' => self.vim.mode = Mode::Insert,
+            'i' => self.vim_begin_insert(),
             'a' => {
                 let ni = (cursor + 1).min(vim::line_end(&text, cursor));
                 self.vim_set_cursor(ctx, editor_id, ni);
-                self.vim.mode = Mode::Insert;
+                self.vim_begin_insert();
             }
             'I' => {
                 let ni = vim::first_non_blank(&text, cursor);
                 self.vim_set_cursor(ctx, editor_id, ni);
-                self.vim.mode = Mode::Insert;
+                self.vim_begin_insert();
             }
             'A' => {
                 let ni = vim::line_end(&text, cursor);
                 self.vim_set_cursor(ctx, editor_id, ni);
-                self.vim.mode = Mode::Insert;
+                self.vim_begin_insert();
             }
             'o' => self.vim_open_line(ctx, editor_id, now, true),
             'O' => self.vim_open_line(ctx, editor_id, now, false),
@@ -1090,9 +1182,17 @@ impl SecureNote {
                 self.vim_delete_chars(cursor, n, true, ctx, editor_id, now);
             }
             's' => {
-                let n = self.vim.take_count();
-                self.vim_delete_chars(cursor, n, false, ctx, editor_id, now);
-                self.vim.mode = Mode::Insert;
+                if cursor < text.len() && text[cursor] != '\n' {
+                    let n = self.vim.take_count();
+                    let last = vim::line_last(&text, cursor);
+                    let end = (cursor + n).min(last + 1);
+                    self.vim_yank(&text, cursor, end, false);
+                    self.vim_begin_insert();
+                    self.vim_delete_raw(cursor, end, now);
+                    self.vim_set_cursor(ctx, editor_id, cursor);
+                } else {
+                    self.vim_begin_insert();
+                }
             }
             'D' => {
                 let end = vim::line_end(&text, cursor);
@@ -1105,9 +1205,9 @@ impl SecureNote {
             'C' => {
                 let end = vim::line_end(&text, cursor);
                 self.vim_yank(&text, cursor, end, false);
-                self.vim_delete_range(cursor, end, now);
+                self.vim_begin_insert();
+                self.vim_delete_raw(cursor, end, now);
                 self.vim_set_cursor(ctx, editor_id, cursor);
-                self.vim.mode = Mode::Insert;
                 self.vim.count = None;
             }
             'S' => {
@@ -1132,6 +1232,8 @@ impl SecureNote {
             ':' => self.vim_open_cmdline(vim::CmdKind::Ex),
             'n' => { let f = self.vim.search_forward; self.vim_search_jump(f, ctx, editor_id); }
             'N' => { let f = self.vim.search_forward; self.vim_search_jump(!f, ctx, editor_id); }
+            ';' => self.vim_repeat_find(false, ctx, editor_id, now),
+            ',' => self.vim_repeat_find(true, ctx, editor_id, now),
             _ => self.vim.count = None,
         }
     }
@@ -1235,16 +1337,39 @@ impl SecureNote {
         }
     }
 
-    fn vim_goto_line(&mut self, n: usize, ctx: &egui::Context) {
-        let text = self.vim_chars();
+    /// First non-blank character index of the 1-based line `n`.
+    fn vim_nth_line_fnb(&self, text: &[char], n: usize) -> usize {
         let mut idx = 0usize;
         let mut line = 1usize;
         while line < n.max(1) && idx < text.len() {
             if text[idx] == '\n' { line += 1; }
             idx += 1;
         }
-        let target = vim::first_non_blank(&text, idx.min(text.len()));
+        vim::first_non_blank(text, idx.min(text.len()))
+    }
+
+    fn vim_goto_line(&mut self, n: usize, ctx: &egui::Context) {
+        let text = self.vim_chars();
+        let target = self.vim_nth_line_fnb(&text, n);
         self.vim_set_cursor(ctx, egui::Id::new("editor"), vim::clamp_normal(&text, target));
+    }
+
+    /// `;` / `,`: repeat the last `f`/`F`/`t`/`T` (same or reversed direction).
+    fn vim_repeat_find(&mut self, reverse: bool, ctx: &egui::Context, editor_id: egui::Id, now: f64) {
+        let Some((kind, ch)) = self.vim.last_find else { self.vim.count = None; return };
+        let k = if reverse { kind.reversed() } else { kind };
+        let text = self.vim_chars();
+        let cursor = self.vim_cursor(ctx, editor_id, text.len());
+        let n = self.vim.take_count();
+        if let Some(target) = vim::find_in_line(&text, cursor, k, ch, n) {
+            let mk = match k {
+                vim::FindKind::Forward | vim::FindKind::Till => vim::MotionKind::Inclusive,
+                _ => vim::MotionKind::Exclusive,
+            };
+            self.vim_move_or_op(&text, cursor, target, mk, ctx, editor_id, now);
+        } else {
+            self.vim.pending_op = None;
+        }
     }
 
     /// `:s/pat/rep/flags` (current line) or `:%s/pat/rep/flags` (whole file).
@@ -1353,7 +1478,6 @@ impl SecureNote {
                 for _ in 0..count.saturating_sub(1) { i = vim::down(s, i, usize::MAX); }
                 (vim::line_last(s, i), vim::MotionKind::Inclusive)
             }
-            'G' => (vim::buffer_bottom(s), vim::MotionKind::Linewise),
             _ => return None,
         };
         Some(r)
@@ -1389,9 +1513,9 @@ impl SecureNote {
             let start = vim::line_start(text, a);
             let end = vim::line_end(text, b);
             self.vim_yank(text, start, end, true);
-            self.vim_delete_range(start, end, now);
+            self.vim_begin_insert();
+            self.vim_delete_raw(start, end, now);
             self.vim_set_cursor(ctx, editor_id, start);
-            self.vim.mode = Mode::Insert;
             return;
         }
 
@@ -1410,9 +1534,9 @@ impl SecureNote {
                 self.vim_set_cursor(ctx, editor_id, vim::clamp_normal(&t2, start));
             }
             vim::Op::Change => {
-                self.vim_delete_range(start, end, now);
+                self.vim_begin_insert();
+                self.vim_delete_raw(start, end, now);
                 self.vim_set_cursor(ctx, editor_id, start);
-                self.vim.mode = Mode::Insert;
             }
         }
     }
@@ -1454,6 +1578,9 @@ impl SecureNote {
     fn vim_toggle_visual(&mut self, target: Mode, cursor: usize) {
         if self.vim.mode == target {
             self.vim.reset_to_normal();
+        } else if self.vim.mode.is_visual() {
+            // Switch between visual sub-modes, keeping the selection endpoints.
+            self.vim.mode = target;
         } else {
             self.vim.mode = target;
             self.vim.visual_anchor = cursor;
@@ -1463,6 +1590,10 @@ impl SecureNote {
 
     /// Apply an operator to the current Visual selection, then return to Normal.
     fn vim_op_visual(&mut self, op: vim::Op, ctx: &egui::Context, editor_id: egui::Id, now: f64) {
+        if self.vim.mode == Mode::VisualBlock {
+            self.vim_op_block(op, ctx, editor_id, now);
+            return;
+        }
         let text = self.vim_chars();
         let a = self.vim.visual_anchor.min(self.vim.vcursor);
         let b = self.vim.visual_anchor.max(self.vim.vcursor);
@@ -1488,18 +1619,18 @@ impl SecureNote {
                 self.vim.reset_to_normal();
             }
             vim::Op::Change => {
+                self.vim.reset_to_normal();
+                self.vim_begin_insert();
                 // For linewise change keep an empty line.
                 if linewise {
                     let s = vim::line_start(&text, a);
                     let e = vim::line_end(&text, b);
-                    self.vim_delete_range(s, e, now);
+                    self.vim_delete_raw(s, e, now);
                     self.vim_set_cursor(ctx, editor_id, s);
                 } else {
-                    self.vim_delete_range(start, end, now);
+                    self.vim_delete_raw(start, end, now);
                     self.vim_set_cursor(ctx, editor_id, start);
                 }
-                self.vim.reset_to_normal();
-                self.vim.mode = Mode::Insert;
             }
         }
     }
@@ -1556,15 +1687,192 @@ impl SecureNote {
         ));
     }
 
+    // ── Visual-Block helpers ─────────────────────────────────────────────────────
+
+    /// Char index of the start of each line.
+    fn vim_line_starts(text: &[char]) -> Vec<usize> {
+        let mut starts = vec![0usize];
+        for (i, &c) in text.iter().enumerate() {
+            if c == '\n' { starts.push(i + 1); }
+        }
+        starts
+    }
+
+    /// `(row, col)` of a char index.
+    fn vim_line_col(text: &[char], idx: usize) -> (usize, usize) {
+        let idx = idx.min(text.len());
+        let start = vim::line_start(text, idx);
+        let row = text[..start].iter().filter(|&&c| c == '\n').count();
+        (row, idx - start)
+    }
+
+    /// Block rectangle `(top_row, bottom_row, left_col, right_col)`.
+    fn vim_block_geom(&self, text: &[char]) -> (usize, usize, usize, usize) {
+        let (ar, ac) = Self::vim_line_col(text, self.vim.visual_anchor);
+        let (cr, cc) = Self::vim_line_col(text, self.vim.vcursor);
+        (ar.min(cr), ar.max(cr), ac.min(cc), ac.max(cc))
+    }
+
+    /// Char ranges (one per row) covered by the block, for highlighting.
+    fn vim_block_ranges(&self, text: &[char]) -> Vec<(usize, usize)> {
+        let (top, bot, left, right) = self.vim_block_geom(text);
+        let starts = Self::vim_line_starts(text);
+        let mut ranges = Vec::new();
+        for r in top..=bot {
+            let Some(&s) = starts.get(r) else { break };
+            let line_end = if r + 1 < starts.len() { starts[r + 1] - 1 } else { text.len() };
+            let len = line_end - s;
+            let c0 = left.min(len);
+            let c1 = (right + 1).min(len);
+            if c1 > c0 {
+                ranges.push((s + c0, s + c1));
+            }
+        }
+        ranges
+    }
+
+    /// Delete / yank / change the block selection.
+    fn vim_op_block(&mut self, op: vim::Op, ctx: &egui::Context, editor_id: egui::Id, now: f64) {
+        let text = self.vim_chars();
+        let (top, bot, left, right) = self.vim_block_geom(&text);
+        let starts = Self::vim_line_starts(&text);
+
+        // Yank the block (rows joined by newlines).
+        let mut yanked = String::new();
+        for r in top..=bot {
+            let Some(&s) = starts.get(r) else { break };
+            let line_end = if r + 1 < starts.len() { starts[r + 1] - 1 } else { text.len() };
+            let len = line_end - s;
+            let c0 = left.min(len);
+            let c1 = (right + 1).min(len);
+            if c1 > c0 { yanked.extend(&text[s + c0..s + c1]); }
+            yanked.push('\n');
+        }
+        self.vim.register = yanked;
+        self.vim.register_linewise = false;
+
+        let top_start = *starts.get(top).unwrap_or(&0);
+        let cursor_target = (top_start + left).min(text.len());
+
+        match op {
+            vim::Op::Yank => {
+                let t = self.vim_chars();
+                self.vim_set_cursor(ctx, editor_id, vim::clamp_normal(&t, cursor_target));
+                self.vim.reset_to_normal();
+            }
+            vim::Op::Delete => {
+                self.vim_snapshot();
+                self.vim_block_delete_columns(&text, &starts, top, bot, left, right, now);
+                self.vim_snapshot();
+                let t = self.vim_chars();
+                self.vim_set_cursor(ctx, editor_id, vim::clamp_normal(&t, cursor_target));
+                self.vim.reset_to_normal();
+            }
+            vim::Op::Change => {
+                self.vim_snapshot();
+                self.vim_block_delete_columns(&text, &starts, top, bot, left, right, now);
+                // Enter block-insert at the left column across the rows.
+                let rows: Vec<usize> = (top + 1..=bot).collect();
+                self.vim.mode = Mode::Insert;
+                self.vim_set_cursor(ctx, editor_id, cursor_target);
+                self.vim.block_insert = Some(vim::BlockInsert { rows, col: left, start: cursor_target });
+            }
+        }
+    }
+
+    /// Remove the `[left, right]` column range from each row (bottom-up so char
+    /// indices stay valid). Uses the raw delete (no per-line undo snapshots).
+    fn vim_block_delete_columns(&mut self, text: &[char], starts: &[usize],
+        top: usize, bot: usize, left: usize, right: usize, now: f64)
+    {
+        for r in (top..=bot).rev() {
+            let Some(&s) = starts.get(r) else { continue };
+            let line_end = if r + 1 < starts.len() { starts[r + 1] - 1 } else { text.len() };
+            let len = line_end - s;
+            let c0 = left.min(len);
+            let c1 = (right + 1).min(len);
+            if c1 > c0 {
+                self.vim_delete_raw(s + c0, s + c1, now);
+            }
+        }
+    }
+
+    /// `I` / `A` in Visual-Block: begin inserting on the top row; the typed text
+    /// is replicated to the other rows when Insert is left.
+    fn vim_block_insert_enter(&mut self, append: bool, ctx: &egui::Context, editor_id: egui::Id, now: f64) {
+        let _ = now;
+        let text = self.vim_chars();
+        let (top, bot, left, right) = self.vim_block_geom(&text);
+        let starts = Self::vim_line_starts(&text);
+        let s = *starts.get(top).unwrap_or(&0);
+        let line_end = if top + 1 < starts.len() { starts[top + 1] - 1 } else { text.len() };
+        let len = line_end - s;
+        let col = if append { right + 1 } else { left };
+        let start = s + col.min(len);
+        let rows: Vec<usize> = (top + 1..=bot).collect();
+
+        self.vim_set_cursor(ctx, editor_id, start);
+        self.vim_begin_insert();
+        self.vim.block_insert = Some(vim::BlockInsert { rows, col, start });
+    }
+
+    /// On leaving a block-insert, replicate the text typed on the top row to the
+    /// other rows at the block column.
+    fn vim_apply_block_insert(&mut self, ctx: &egui::Context, editor_id: egui::Id, now: f64) {
+        let Some(bi) = self.vim.block_insert.take() else { return };
+        let text = self.vim_chars();
+        let cursor = self.vim_cursor_index(ctx, editor_id).min(text.len());
+        if cursor <= bi.start { return; }
+        let inserted: String = text[bi.start..cursor].iter().collect();
+        if inserted.is_empty() || inserted.contains('\n') { return; }
+
+        let starts = Self::vim_line_starts(&text);
+        // Bottom-up so earlier rows' char indices remain valid.
+        for &r in bi.rows.iter().rev() {
+            let Some(&s) = starts.get(r) else { continue };
+            let line_end = if r + 1 < starts.len() { starts[r + 1] - 1 } else { text.len() };
+            let len = line_end - s;
+            let pos = s + bi.col.min(len);
+            self.vim_insert_raw(pos, &inserted, now);
+        }
+    }
+
+    /// The Vim `showcmd`: the pending (partial) command being typed.
+    fn vim_showcmd(&self) -> String {
+        let mut s = String::new();
+        if let Some(p) = self.vim.pending_op {
+            if p.count > 1 { s.push_str(&p.count.to_string()); }
+            s.push(match p.op {
+                vim::Op::Delete => 'd',
+                vim::Op::Change => 'c',
+                vim::Op::Yank => 'y',
+            });
+        }
+        if let Some(cnt) = self.vim.count {
+            s.push_str(&cnt.to_string());
+        }
+        if self.vim.pending_g { s.push('g'); }
+        if let Some(fk) = self.vim.pending_find {
+            s.push(match fk {
+                vim::FindKind::Forward => 'f',
+                vim::FindKind::Back => 'F',
+                vim::FindKind::Till => 't',
+                vim::FindKind::TillBack => 'T',
+            });
+        }
+        if self.vim.pending_replace { s.push('r'); }
+        s
+    }
+
     /// `o` / `O`: open a new line below/above and enter Insert mode.
     fn vim_open_line(&mut self, ctx: &egui::Context, editor_id: egui::Id, now: f64, below: bool) {
         let text = self.vim_chars();
         let i = self.vim_cursor_index(ctx, editor_id).min(text.len());
         let insert_at = if below { vim::line_end(&text, i) } else { vim::line_start(&text, i) };
-        self.vim_insert_text(insert_at, "\n", now);
+        self.vim_begin_insert();
+        self.vim_insert_raw(insert_at, "\n", now);
         let cursor = if below { insert_at + 1 } else { insert_at };
         self.vim_set_cursor(ctx, editor_id, cursor);
-        self.vim.mode = Mode::Insert;
         self.vim.want_col = None;
     }
 }
@@ -1609,8 +1917,11 @@ impl eframe::App for SecureNote {
             self.save_now(ctx);
         }
 
-        // Undo snapshot on typing inactivity.
-        if self.dirty && !self.undo_in_progress && self.last_edit_time > 0.0
+        // Undo snapshot on typing inactivity. Suppressed during a Vim insert
+        // session so the whole insert collapses into one undo step (a snapshot is
+        // taken when insert begins and again on Esc).
+        let vim_inserting = self.prefs.vim_mode && self.vim.mode == Mode::Insert;
+        if self.dirty && !self.undo_in_progress && !vim_inserting && self.last_edit_time > 0.0
             && now - self.last_edit_time >= UNDO_INTERVAL
             && now - self.undo_last_snap  >= UNDO_INTERVAL
         {
@@ -1986,6 +2297,18 @@ impl SecureNote {
                             self.prefs.preview_open = !self.prefs.preview_open;
                             self.persist_prefs();
                         }
+
+                        let vimc = if self.prefs.vim_mode { accent } else { ui.visuals().text_color() };
+                        if ui.button(RichText::new("Vim").size(12.0).color(vimc))
+                            .on_hover_text("Toggle Vim mode").clicked()
+                        {
+                            self.prefs.vim_mode = !self.prefs.vim_mode;
+                            self.persist_prefs();
+                            self.vim.reset_to_normal();
+                            if self.prefs.vim_mode {
+                                ctx.memory_mut(|m| m.request_focus(egui::Id::new("editor")));
+                            }
+                        }
                     });
                 });
             });
@@ -2268,7 +2591,8 @@ impl SecureNote {
                         let mc = match self.vim.mode {
                             Mode::Normal => Color32::from_rgb(124, 106, 247),
                             Mode::Insert => Color32::from_rgb(92, 224, 138),
-                            Mode::Visual | Mode::VisualLine => Color32::from_rgb(224, 170, 60),
+                            Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+                                => Color32::from_rgb(224, 170, 60),
                         };
                         ui.label(RichText::new(self.vim.mode.label())
                             .size(11.0).strong().monospace().color(mc));
@@ -2304,6 +2628,14 @@ impl SecureNote {
                         ui.label(RichText::new("enc").size(11.0).monospace()
                             .color(Color32::from_rgb(92, 224, 138)));
                         ui.label(RichText::new("  |  ").size(11.0).monospace().color(Color32::from_rgb(60,60,70)));
+                        // Vim showcmd: the pending (partial) command, always shown.
+                        if self.prefs.vim_mode {
+                            let cmd = self.vim_showcmd();
+                            ui.add_sized([44.0, 16.0], egui::Label::new(
+                                RichText::new(cmd).size(11.0).monospace()
+                                    .color(Color32::from_rgb(200, 170, 60))));
+                            ui.label(RichText::new("  |  ").size(11.0).monospace().color(Color32::from_rgb(60,60,70)));
+                        }
                         let (sb_text, sb_color) = if self.dirty {
                             ("unsaved", Color32::from_rgb(224, 140, 40))
                         } else {
@@ -2539,6 +2871,7 @@ impl SecureNote {
         let vim_normal_active = vim_engaged && self.vim.mode == Mode::Normal;
         // Vim owns the cursor/selection in Normal and Visual modes.
         let vim_owns_selection = vim_engaged && self.vim.mode != Mode::Insert;
+        let vim_block_active = vim_engaged && self.vim.mode == Mode::VisualBlock;
 
         let font_size   = self.prefs.font_size;
         let word_wrap   = self.prefs.word_wrap;
@@ -2779,6 +3112,22 @@ impl SecureNote {
                             block, 1.0,
                             Color32::from_rgba_unmultiplied(124, 106, 247, 110),
                         );
+                    }
+                }
+
+                // Vim Visual-Block selection: paint the column rectangle per row.
+                if vim_block_active {
+                    let text: Vec<char> = self.tabs[self.active_tab].content.chars().collect();
+                    let painter = ui.painter();
+                    let color = Color32::from_rgba_unmultiplied(224, 170, 60, 70);
+                    for (s, e) in self.vim_block_ranges(&text) {
+                        let sc = output.galley.from_ccursor(egui::text::CCursor::new(s));
+                        let ec = output.galley.from_ccursor(egui::text::CCursor::new(e));
+                        let r0 = output.galley.pos_from_cursor(&sc);
+                        let r1 = output.galley.pos_from_cursor(&ec);
+                        let min = output.galley_pos + r0.min.to_vec2();
+                        let max = output.galley_pos + egui::vec2(r1.min.x, r0.max.y);
+                        painter.rect_filled(egui::Rect::from_min_max(min, max), 1.0, color);
                     }
                 }
             });
