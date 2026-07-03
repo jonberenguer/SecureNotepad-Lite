@@ -205,7 +205,7 @@ An optional, toggleable Vim editing mode. Turn it on with the **Vim** button in 
 
 It supports Normal / Insert / Visual / Visual-Line / **Visual-Block** modes with a block cursor and `showcmd` indicator; motions (`hjkl`, `w b e`, `0 ^ $`, `{ }`, `f/F/t/T`, `; ,`, `gg` / `{count}G`) with counts; operators (`d c y` + motions, `dd`/`yy`/`cc`, `D C X S s r`, `p`/`P`); `u` / `Ctrl-r` undo/redo; `/` `?` search with `n`/`N`; and `:` ex commands (`:w`, `:q`, `:s/…`, `:%s/…`, `:{number}`, `:noh`). Arrow keys also navigate in Normal mode.
 
-Yank/delete use an **internal register kept off the OS clipboard**, consistent with the app's clipboard-auto-clear feature.
+Yank/delete copy to the **system clipboard** (and to an in-memory register), so they paste into other apps; the app's **clipboard auto-clear** still applies, and `p`/`P` fall back to the register once the clipboard clears.
 
 See **[docs/vim-mode.md](docs/vim-mode.md)** for the full command reference and known limitations.
 

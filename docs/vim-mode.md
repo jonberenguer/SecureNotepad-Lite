@@ -10,9 +10,11 @@ The current mode is shown at the left of the status bar
 cursor is drawn over the character under the cursor. The pending (partial)
 command — the Vim `showcmd` — is shown near the right of the status bar.
 
-Yanks and deletes use an **internal register** and are deliberately kept **off
-the OS clipboard**, consistent with the app's clipboard-auto-clear security
-feature.
+Yanks and deletes go to the **OS clipboard** (so they paste in other apps) and
+also to an in-memory register. The app's **clipboard auto-clear** still applies —
+once the clipboard is cleared, `p` / `P` fall back to the in-memory register, so
+in-app paste keeps working. Paste prefers the OS clipboard, so text copied
+elsewhere pastes into the editor too.
 
 ---
 
@@ -98,10 +100,12 @@ planned future work.
   do not implement Vim's full paragraph rules.
 
 ### Registers / clipboard
-- **Single unnamed register only.** No named registers (`"a`) and no macros
-  (`q`). *(Tier 3)*
-- **No system-clipboard integration** (`"+y` / `"+p`). Yank/paste use the
-  internal register only, by design. *(Tier 3)*
+- **Single unnamed register.** Yank/delete write to the OS clipboard and one
+  in-memory register; there are no named registers (`"a`), explicit `"+`, or
+  macros (`q`). *(Tier 3)*
+- **Linewise-ness is inferred on paste.** `p` treats the clipboard as linewise
+  only when it still matches the last yank; text copied from another app pastes
+  charwise.
 
 ### Search & substitute
 - **Rust regex, not Vim regex.** Search and `:s` use the Rust `regex` crate, so

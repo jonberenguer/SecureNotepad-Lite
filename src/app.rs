@@ -1189,7 +1189,7 @@ impl SecureNote {
                     let n = self.vim.take_count();
                     let last = vim::line_last(&text, cursor);
                     let end = (cursor + n).min(last + 1);
-                    self.vim_yank(&text, cursor, end, false);
+                    self.vim_yank(ctx, &text, cursor, end, false);
                     self.vim_begin_insert();
                     self.vim_delete_raw(cursor, end, now);
                     self.vim_set_cursor(ctx, editor_id, cursor);
@@ -1199,7 +1199,7 @@ impl SecureNote {
             }
             'D' => {
                 let end = vim::line_end(&text, cursor);
-                self.vim_yank(&text, cursor, end, false);
+                self.vim_yank(ctx, &text, cursor, end, false);
                 self.vim_delete_range(cursor, end, now);
                 let t2 = self.vim_chars();
                 self.vim_set_cursor(ctx, editor_id, vim::clamp_normal(&t2, cursor));
@@ -1207,7 +1207,7 @@ impl SecureNote {
             }
             'C' => {
                 let end = vim::line_end(&text, cursor);
-                self.vim_yank(&text, cursor, end, false);
+                self.vim_yank(ctx, &text, cursor, end, false);
                 self.vim_begin_insert();
                 self.vim_delete_raw(cursor, end, now);
                 self.vim_set_cursor(ctx, editor_id, cursor);
@@ -1500,10 +1500,21 @@ impl SecureNote {
         }
     }
 
-    fn vim_yank(&mut self, text: &[char], start: usize, end: usize, linewise: bool) {
+    /// Store text in the Vim register and mirror it to the OS clipboard (so Vim
+    /// yank/delete are pasteable in other apps). The existing clipboard-auto-clear
+    /// still applies; the in-memory register is the fallback once it clears.
+    fn vim_set_register(&mut self, ctx: &egui::Context, text: String, linewise: bool) {
+        if !text.is_empty() {
+            ctx.output_mut(|o| o.copied_text = text.clone());
+        }
+        self.vim.register = text;
+        self.vim.register_linewise = linewise;
+    }
+
+    fn vim_yank(&mut self, ctx: &egui::Context, text: &[char], start: usize, end: usize, linewise: bool) {
         if end > start {
-            self.vim.register = text[start..end].iter().collect();
-            self.vim.register_linewise = linewise;
+            let s: String = text[start..end].iter().collect();
+            self.vim_set_register(ctx, s, linewise);
         }
     }
 
@@ -1515,7 +1526,7 @@ impl SecureNote {
             let (a, b) = (from.min(target), from.max(target));
             let start = vim::line_start(text, a);
             let end = vim::line_end(text, b);
-            self.vim_yank(text, start, end, true);
+            self.vim_yank(ctx, text, start, end, true);
             self.vim_begin_insert();
             self.vim_delete_raw(start, end, now);
             self.vim_set_cursor(ctx, editor_id, start);
@@ -1526,7 +1537,7 @@ impl SecureNote {
         if end <= start {
             return;
         }
-        self.vim_yank(text, start, end, linewise);
+        self.vim_yank(ctx, text, start, end, linewise);
         match op {
             vim::Op::Yank => {
                 self.vim_set_cursor(ctx, editor_id, vim::clamp_normal(text, start));
@@ -1572,7 +1583,7 @@ impl SecureNote {
             (cursor, (cursor + n).min(last + 1))
         };
         if end <= start { return; }
-        self.vim_yank(&text, start, end, false);
+        self.vim_yank(ctx, &text, start, end, false);
         self.vim_delete_range(start, end, now);
         let t2 = self.vim_chars();
         self.vim_set_cursor(ctx, editor_id, vim::clamp_normal(&t2, start));
@@ -1609,7 +1620,7 @@ impl SecureNote {
         } else {
             (a, (b + 1).min(text.len()), false)
         };
-        self.vim_yank(&text, start, end, lw);
+        self.vim_yank(ctx, &text, start, end, lw);
         match op {
             vim::Op::Yank => {
                 self.vim_set_cursor(ctx, editor_id, vim::clamp_normal(&text, start));
@@ -1640,12 +1651,24 @@ impl SecureNote {
 
     /// Paste the register `n` times, after (`p`) or before (`P`) the cursor.
     fn vim_paste(&mut self, after: bool, n: usize, ctx: &egui::Context, editor_id: egui::Id, now: f64) {
-        if self.vim.register.is_empty() { return; }
+        // Prefer the OS clipboard so content copied elsewhere pastes here. If the
+        // clipboard matches the last yank, reuse its linewise flag; if it was
+        // cleared (auto-clear writes a single space) or is empty, fall back to the
+        // in-memory register.
+        let sys = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok());
+        let (unit, linewise) = match sys {
+            Some(ref s) if !s.is_empty() && *s == self.vim.register =>
+                (self.vim.register.clone(), self.vim.register_linewise),
+            Some(s) if !s.is_empty() && s != " " => (s, false),
+            _ => (self.vim.register.clone(), self.vim.register_linewise),
+        };
+        if unit.is_empty() { return; }
+
         let text = self.vim_chars();
         let cursor = self.vim_cursor(ctx, editor_id, text.len());
-        let mut block = self.vim.register.repeat(n);
+        let mut block = unit.repeat(n);
 
-        if self.vim.register_linewise {
+        if linewise {
             if !block.ends_with('\n') { block.push('\n'); }
             let (at, cursor_line_start) = if after {
                 let nl = vim::line_end(&text, cursor);
@@ -1751,8 +1774,7 @@ impl SecureNote {
             if c1 > c0 { yanked.extend(&text[s + c0..s + c1]); }
             yanked.push('\n');
         }
-        self.vim.register = yanked;
-        self.vim.register_linewise = false;
+        self.vim_set_register(ctx, yanked, false);
 
         let top_start = *starts.get(top).unwrap_or(&0);
         let cursor_target = (top_start + left).min(text.len());
