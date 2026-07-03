@@ -36,6 +36,7 @@ A cross-platform native desktop notepad with AES-256-GCM encryption. No web brow
 | ↩️ | **Word wrap** toggle — wrap to width, or turn off for horizontal scrolling |
 | #️⃣ | **Line numbers** with optional **relative** (vim-style) mode — aligned correctly even when lines wrap |
 | 🔤 | **Embedded editor fonts** — built-in monospace plus **JetBrains Mono** and **Hack**, selectable in Preferences |
+| ⌨️ | **Vim mode** (optional) — modal editing with Normal/Insert/Visual/Visual-Block, operators, counts, search & `:` ex commands ([details](docs/vim-mode.md)) |
 | 🔍 | **Find & Replace** with regex support, match counter, and prev/next navigation |
 | 🔁 | **Undo / Redo** — toolbar buttons (next to Save) or `Ctrl+Z` / `Ctrl+Y`; per-tab snapshot history, preserved across tab switches |
 | 🔒 | **Per-tab locking** — lock individual tabs behind the master password for screen-sharing safety |
@@ -194,6 +195,19 @@ Configured under **Preferences → EDITOR** (all persisted across launches):
 - **Word wrap** — on by default; long lines wrap to the editor width. Turn it off to keep lines unwrapped with horizontal scrolling instead.
 - **Line numbers** — show a line-number gutter. The gutter is pinned to the left and aligned to each rendered row, so numbers stay correct even when **word wrap** splits a logical line across several visual rows.
 - **Relative numbers** — when line numbers are on, show each line's distance from the cursor line (vim-style), with the current line showing its absolute number.
+- **Vim mode** — optional modal editing (see below).
+
+---
+
+## Vim Mode
+
+An optional, toggleable Vim editing mode. Turn it on with the **Vim** button in the toolbar or **Preferences → EDITOR → Vim mode**. When it's off, the editor behaves exactly as before.
+
+It supports Normal / Insert / Visual / Visual-Line / **Visual-Block** modes with a block cursor and `showcmd` indicator; motions (`hjkl`, `w b e`, `0 ^ $`, `{ }`, `f/F/t/T`, `; ,`, `gg` / `{count}G`) with counts; operators (`d c y` + motions, `dd`/`yy`/`cc`, `D C X S s r`, `p`/`P`); `u` / `Ctrl-r` undo/redo; `/` `?` search with `n`/`N`; and `:` ex commands (`:w`, `:q`, `:s/…`, `:%s/…`, `:{number}`, `:noh`). Arrow keys also navigate in Normal mode.
+
+Yank/delete use an **internal register kept off the OS clipboard**, consistent with the app's clipboard-auto-clear feature.
+
+See **[docs/vim-mode.md](docs/vim-mode.md)** for the full command reference and known limitations.
 
 ---
 

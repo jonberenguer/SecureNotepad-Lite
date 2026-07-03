@@ -38,6 +38,9 @@ pub struct Prefs {
     /// Editor font family name (must match a registered family).
     #[serde(default = "default_editor_font")]
     pub editor_font: String,
+    /// Opt-in Vim editing mode.
+    #[serde(default)]
+    pub vim_mode: bool,
     pub win_x: Option<f32>,
     pub win_y: Option<f32>,
     pub win_w: Option<f32>,
@@ -60,6 +63,7 @@ impl Default for Prefs {
             line_numbers:          false,
             relative_numbers:      false,
             editor_font:           default_editor_font(),
+            vim_mode:              false,
             win_x: None, win_y: None,
             win_w: None, win_h: None,
         }
