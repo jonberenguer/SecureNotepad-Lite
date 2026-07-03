@@ -197,6 +197,8 @@ pub struct SecureNote {
 
     // Vim mode state (only active when prefs.vim_mode is enabled).
     vim: Vim,
+    // Active tab seen last frame, to reset Vim state when the tab changes.
+    vim_prev_tab: usize,
 
     // Per-tab undo/redo history keyed by tab.id
     undo_stacks:      HashMap<u32, Vec<String>>,
@@ -261,6 +263,7 @@ impl SecureNote {
             tab_overflow:       false,
             context_sel:        None,
             vim:                Vim::default(),
+            vim_prev_tab:       0,
             undo_stacks:        HashMap::new(),
             undo_positions:     HashMap::new(),
             undo_last_snap:     0.0,
@@ -2796,6 +2799,13 @@ impl SecureNote {
 
     fn ui_text_editor(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, now: f64) {
         if self.tabs.is_empty() { return; }
+
+        // Switching tabs invalidates Vim's cursor/selection indices (they point
+        // into the previous buffer), so return to Normal mode on any tab change.
+        if self.active_tab != self.vim_prev_tab {
+            self.vim.reset_to_normal();
+            self.vim_prev_tab = self.active_tab;
+        }
 
         // Locked tab overlay
         if self.tabs[self.active_tab].locked {
