@@ -1,7 +1,7 @@
 # Vim Mode — Planning & Design Notes
 
 Status: **planning / discussion** (no implementation yet).
-Branch: `vim-feature`.
+Branch: `vim-mode`.
 
 This document captures the plan for an opt-in, toggleable Vim editing mode for
 the editor, including why a previous attempt destabilized the app and how to
@@ -94,6 +94,60 @@ Strict priority order, reusing the existing focus-lock filter:
 
 ---
 
+## Code Integration Audit (against current `main`)
+
+The plan above predates several editor features now on `main` (line-number
+gutter, word-wrap layouter, continuous selection tracking, Markdown preview).
+Re-audited against the current code, the core approach still holds, but these
+integration points must be handled. (Line numbers are approximate.)
+
+### 1. Selection-tracking collision (highest priority)
+The editor continuously tracks `self.context_sel` from the live selection every
+frame and **restores** it on right-press (`app.rs` ~1815-1835, powering the
+right-click menu). Vim Visual mode and a faked block cursor both drive the same
+selection via `set_char_range`, so the two systems will fight: a 1-char block
+cursor would light up right-click Cut/Copy, and restore-on-right-press would
+clobber the Visual anchor.
+**Decision:** when vim is on and `mode != Insert`, bypass the `context_sel`
+tracker/restore and let vim own the selection.
+
+### 2. Block cursor + gutter / wrap interplay
+Paint the block cursor with the **same galley-row technique** already used for
+search highlights and line numbers (`app.rs` ~1908-1955), accounting for the
+gutter x-offset (already baked into `galley_pos.x`).
+With **word wrap on**, `j`/`k` should move by *logical* line (vim `nowrap`
+semantics), with `gj`/`gk` for visual rows. Column motions (`0`/`^`/`$`) act on
+logical-line char boundaries in `content`, independent of wrapping.
+
+### 3. Scroll-to-cursor
+Because vim sets the cursor via `TextEditState` rather than egui's own key
+handling, off-screen motions (`j`, `G`, `gg`) will **not** auto-scroll for free.
+Compute the caret's row rect from the galley and `scroll_to_rect` it. Verify
+early — it's an easy thing to miss and makes navigation feel broken.
+
+### 4. Yank register vs system clipboard (security decision)
+The app deliberately clears the OS clipboard after copies. Routing vim `y`/`p`
+through the OS clipboard would spray secrets into it on every yank.
+**Decision (default):** `y` / `d` / `p` use an **internal vim register**, keeping
+secrets off the OS clipboard. Explicit `"+y` / `"+p` may target the system
+clipboard. This reinforces the app's existing security posture.
+
+### 5. Escape chain — concrete wiring
+Two Escape handlers already exist: search/prefs close (`app.rs` ~1103, consumes
+`NONE+Escape`) and the editor focus-lock filter (`app.rs` ~1970, `escape:true` —
+**must be kept**). Vim's "Insert/Visual → Normal" slots in **after** the
+search/prefs check and **before** egui unfocus, and must live in the editor path
+(not `handle_shortcuts`).
+
+### Minor
+- Mode-state scope: single global current-mode; reset to Normal on tab switch and
+  on lock.
+- Interception is gated on `ctx.memory(has_focus(editor_id))`, so the Find box,
+  inline tab-rename, and password fields stay unaffected.
+- Command-line UX for `/` and `:` still open (reuse Find bar vs new bottom line).
+
+---
+
 ## Feature tiers
 
 ### Tier 1 — core modal editing (medium)
@@ -121,7 +175,7 @@ the costly, bug-prone parts — and the ones not everyone uses.
 ## De-risking plan
 
 1. **Preserve the known-good state.** Current features are committed and pushed
-   to `main`; this branch (`vim-feature`) is for the Vim work.
+   to `main`; this branch (`vim-mode`) is for the Vim work.
 2. **Phase 0 MVP to prove the foundation:** toggle + mode switching + `h j k l`,
    `i` / `a`, `Esc`, status indicator — with **zero** regressions to typing,
    Find, rename, passwords, and shortcuts. This is precisely the layer that broke
@@ -145,5 +199,13 @@ the costly, bug-prone parts — and the ones not everyone uses.
 
 ## Decisions log
 
+- **Input interception:** Option A — strip `Text`/`Key` events before the
+  `TextEdit` in Normal/Visual mode. (Architecture)
+- **Selection ownership:** vim owns the selection when `mode != Insert`; the
+  `context_sel` right-click tracker/restore is bypassed then. (Audit #1)
+- **Yank/paste:** default to an internal register; `"+` targets the OS clipboard.
+  (Audit #4)
 - (pending) Target scope for the first branch.
-- (pending) Answers to the open questions above.
+- (pending) `j`/`k` default wrap semantics (logical vs visual rows).
+- (pending) Command-line UX (reuse Find bar vs a bottom `:` line).
+- (pending) Which day-to-day Vim features to include (open question #1).
