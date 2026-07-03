@@ -16,6 +16,8 @@ pub enum Mode {
     #[default]
     Normal,
     Insert,
+    Visual,
+    VisualLine,
 }
 
 impl Mode {
@@ -23,8 +25,42 @@ impl Mode {
         match self {
             Mode::Normal => "NORMAL",
             Mode::Insert => "INSERT",
+            Mode::Visual => "VISUAL",
+            Mode::VisualLine => "V-LINE",
         }
     }
+    pub fn is_visual(self) -> bool {
+        matches!(self, Mode::Visual | Mode::VisualLine)
+    }
+}
+
+/// Pending operator awaiting a motion (`d`/`c`/`y`), carrying its count.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PendingOp {
+    pub op: Op,
+    pub count: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    Delete,
+    Change,
+    Yank,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FindKind {
+    Forward,  // f
+    Back,     // F
+    Till,     // t
+    TillBack, // T
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MotionKind {
+    Exclusive,
+    Inclusive,
+    Linewise,
 }
 
 /// Persistent Vim state carried on the app.
@@ -35,13 +71,40 @@ pub struct Vim {
     pub pending_g: bool,
     /// Desired column for vertical motion (`j`/`k`), Vim-style.
     pub want_col: Option<usize>,
+    /// Accumulated numeric count prefix.
+    pub count: Option<usize>,
+    /// Operator awaiting a motion.
+    pub pending_op: Option<PendingOp>,
+    /// `f`/`F`/`t`/`T` awaiting a target character.
+    pub pending_find: Option<FindKind>,
+    /// `r` awaiting a replacement character.
+    pub pending_replace: bool,
+    /// Visual-mode anchor (the fixed end of the selection).
+    pub visual_anchor: usize,
+    /// Visual-mode moving cursor (the end that motions move).
+    pub vcursor: usize,
+    /// Internal yank/delete register (kept off the OS clipboard for security).
+    pub register: String,
+    /// Whether the register holds whole lines (linewise).
+    pub register_linewise: bool,
 }
 
 impl Vim {
+    /// Reset transient command state, returning to Normal mode. The register is
+    /// preserved (it survives across commands, like Vim).
     pub fn reset_to_normal(&mut self) {
         self.mode = Mode::Normal;
         self.pending_g = false;
         self.want_col = None;
+        self.count = None;
+        self.pending_op = None;
+        self.pending_find = None;
+        self.pending_replace = false;
+    }
+
+    /// Consume the pending count (default 1).
+    pub fn take_count(&mut self) -> usize {
+        self.count.take().unwrap_or(1).max(1)
     }
 }
 
@@ -230,6 +293,97 @@ pub fn buffer_top(s: &[char]) -> usize {
     first_non_blank(s, 0)
 }
 
+/// `f`/`F`/`t`/`T`: find the `count`-th `ch` on the current line. Returns the
+/// resulting cursor index (for `t`/`T`, one short of the match).
+pub fn find_in_line(s: &[char], cursor: usize, kind: FindKind, ch: char, count: usize) -> Option<usize> {
+    let count = count.max(1);
+    let start = line_start(s, cursor);
+    let end = line_end(s, cursor);
+    match kind {
+        FindKind::Forward | FindKind::Till => {
+            let mut found = 0;
+            let mut j = cursor + 1;
+            while j < end {
+                if s[j] == ch {
+                    found += 1;
+                    if found == count {
+                        return Some(if kind == FindKind::Till { j - 1 } else { j });
+                    }
+                }
+                j += 1;
+            }
+            None
+        }
+        FindKind::Back | FindKind::TillBack => {
+            let mut found = 0;
+            let mut j = cursor;
+            while j > start {
+                j -= 1;
+                if s[j] == ch {
+                    found += 1;
+                    if found == count {
+                        return Some(if kind == FindKind::TillBack { j + 1 } else { j });
+                    }
+                }
+            }
+            None
+        }
+    }
+}
+
+/// `}`: move to the next blank-line paragraph boundary.
+pub fn paragraph_forward(s: &[char], i: usize) -> usize {
+    let n = s.len();
+    let mut k = i;
+    while k < n {
+        if s[k] == '\n' && (k + 1 >= n || s[k + 1] == '\n') {
+            return (k + 1).min(n);
+        }
+        k += 1;
+    }
+    n
+}
+
+/// `{`: move to the previous blank-line paragraph boundary.
+pub fn paragraph_backward(s: &[char], i: usize) -> usize {
+    let mut k = i;
+    while k > 0 {
+        k -= 1;
+        if s[k] == '\n' && (k == 0 || s[k - 1] == '\n') {
+            return k;
+        }
+    }
+    0
+}
+
+/// Character range `[start, end)` an operator should act on, given the cursor and
+/// a motion target with its kind. Linewise expands to whole lines (including the
+/// trailing newline, so `dd` removes the line). Returns `(start, end, linewise)`.
+pub fn op_range(s: &[char], from: usize, target: usize, kind: MotionKind) -> (usize, usize, bool) {
+    match kind {
+        MotionKind::Exclusive => {
+            let (a, b) = (from.min(target), from.max(target));
+            (a, b, false)
+        }
+        MotionKind::Inclusive => {
+            let (a, b) = (from.min(target), from.max(target));
+            (a, (b + 1).min(s.len()), false)
+        }
+        MotionKind::Linewise => {
+            let (a0, b0) = (from.min(target), from.max(target));
+            let mut start = line_start(s, a0);
+            let nl = line_end(s, b0);
+            let end = if nl < s.len() { nl + 1 } else { nl };
+            // Deleting the last line (no trailing newline) also removes the
+            // preceding newline so no blank line is left behind.
+            if end == s.len() && start > 0 && s[start - 1] == '\n' {
+                start -= 1;
+            }
+            (start, end, true)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +440,43 @@ mod tests {
         let s = v("ab\n\ncd");
         assert_eq!(clamp_normal(&s, 2), 1); // newline pos → last char 'b'
         assert_eq!(clamp_normal(&s, 3), 3); // empty line stays
+    }
+
+    #[test]
+    fn find_char_on_line() {
+        let s = v("abcabc");
+        assert_eq!(find_in_line(&s, 0, FindKind::Forward, 'c', 1), Some(2));
+        assert_eq!(find_in_line(&s, 0, FindKind::Forward, 'c', 2), Some(5));
+        assert_eq!(find_in_line(&s, 0, FindKind::Till, 'c', 1), Some(1));
+        assert_eq!(find_in_line(&s, 5, FindKind::Back, 'a', 1), Some(3));
+        assert_eq!(find_in_line(&s, 0, FindKind::Forward, 'z', 1), None);
+        // does not cross line boundary
+        let s2 = v("ab\ncd");
+        assert_eq!(find_in_line(&s2, 0, FindKind::Forward, 'c', 1), None);
+    }
+
+    #[test]
+    fn operator_ranges() {
+        let s = v("hello world");
+        // dw from 0 → exclusive [0,6)
+        assert_eq!(op_range(&s, 0, 6, MotionKind::Exclusive), (0, 6, false));
+        // de from 0 (e→4) inclusive [0,5)
+        assert_eq!(op_range(&s, 0, 4, MotionKind::Inclusive), (0, 5, false));
+        // linewise dd on a middle line includes its newline
+        let s2 = v("a\nb\nc");
+        let (st, en, lw) = op_range(&s2, 2, 2, MotionKind::Linewise);
+        assert_eq!((st, en, lw), (2, 4, true)); // "b\n"
+        // linewise on the last line also removes the preceding newline
+        let (st2, en2, _) = op_range(&s2, 4, 4, MotionKind::Linewise);
+        assert_eq!((st2, en2), (3, 5)); // "\nc"
+    }
+
+    #[test]
+    fn paragraph_motions() {
+        let s = v("a\nb\n\nc\nd");
+        // forward from 0 → blank line at index 4
+        assert_eq!(paragraph_forward(&s, 0), 4);
+        // backward from end → blank line boundary
+        assert_eq!(paragraph_backward(&s, 7), 4);
     }
 }

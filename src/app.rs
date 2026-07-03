@@ -818,6 +818,47 @@ impl SecureNote {
             egui::text::CCursorRange::one(egui::text::CCursor::new(idx)));
     }
 
+    fn vim_chars(&self) -> Vec<char> {
+        self.tabs[self.active_tab].content.chars().collect()
+    }
+
+    /// The cursor Vim operates on: the tracked visual cursor in Visual mode, else
+    /// the egui caret.
+    fn vim_cursor(&self, ctx: &egui::Context, editor_id: egui::Id, len: usize) -> usize {
+        if self.vim.mode.is_visual() {
+            self.vim.vcursor.min(len)
+        } else {
+            self.vim_cursor_index(ctx, editor_id).min(len)
+        }
+    }
+
+    /// Delete a character range `[start, end)` as one undo step.
+    fn vim_delete_range(&mut self, start: usize, end: usize, now: f64) {
+        if end <= start { return; }
+        let id = self.tabs[self.active_tab].id;
+        self.push_undo_snap(id, self.tabs[self.active_tab].content.clone());
+        let content = &mut self.tabs[self.active_tab].content;
+        let ba = char_to_byte(content, start);
+        let bb = char_to_byte(content, end);
+        content.replace_range(ba..bb, "");
+        self.push_undo_snap(id, self.tabs[self.active_tab].content.clone());
+        self.dirty = true;
+        self.last_edit_time = now;
+    }
+
+    /// Insert text at a character position as one undo step.
+    fn vim_insert_text(&mut self, at: usize, s: &str, now: f64) {
+        if s.is_empty() { return; }
+        let id = self.tabs[self.active_tab].id;
+        self.push_undo_snap(id, self.tabs[self.active_tab].content.clone());
+        let content = &mut self.tabs[self.active_tab].content;
+        let byte = char_to_byte(content, at);
+        content.insert_str(byte, s);
+        self.push_undo_snap(id, self.tabs[self.active_tab].content.clone());
+        self.dirty = true;
+        self.last_edit_time = now;
+    }
+
     /// Drive Vim mode for this frame. Called before the TextEdit is shown, only
     /// when Vim is enabled and the editor holds keyboard focus.
     fn vim_step(&mut self, ctx: &egui::Context, editor_id: egui::Id, now: f64) {
@@ -826,26 +867,29 @@ impl SecureNote {
                 // Esc leaves Insert mode, nudging the cursor left one column (Vim).
                 if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, EKey::Escape)) {
                     let idx  = self.vim_cursor_index(ctx, editor_id);
-                    let text: Vec<char> = self.tabs[self.active_tab].content.chars().collect();
+                    let text = self.vim_chars();
                     let ni = vim::left(&text, idx);
                     self.vim_set_cursor(ctx, editor_id, vim::clamp_normal(&text, ni));
-                    // Snapshot the inserted text as one undo unit.
                     let id = self.tabs[self.active_tab].id;
                     self.push_undo_snap(id, self.tabs[self.active_tab].content.clone());
                     self.vim.reset_to_normal();
                 }
             }
-            Mode::Normal => self.vim_normal_input(ctx, editor_id, now),
+            _ => self.vim_active_input(ctx, editor_id, now),
+        }
+        // Reflect the Visual selection in the egui caret/selection for highlight.
+        if self.vim.mode.is_visual() {
+            self.vim_sync_visual_selection(ctx, editor_id);
         }
     }
 
-    fn vim_normal_input(&mut self, ctx: &egui::Context, editor_id: egui::Id, now: f64) {
-        // Ctrl-r → redo (Vim), before the generic key strip below.
+    /// Read this frame's keys, drive the FSM, then strip the events so the
+    /// TextEdit never inserts. Shared by Normal and Visual modes.
+    fn vim_active_input(&mut self, ctx: &egui::Context, editor_id: egui::Id, now: f64) {
         if ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, EKey::R)) {
             self.do_redo(ctx);
         }
 
-        // Collect this frame's typed characters and whether Escape was pressed.
         let mut typed: Vec<char> = Vec::new();
         let mut escape = false;
         ctx.input(|i| {
@@ -857,123 +901,460 @@ impl SecureNote {
                 }
             }
         });
+
         if escape {
-            self.vim.pending_g = false;
-        }
-        for c in typed {
-            self.vim_normal_char(c, ctx, editor_id, now);
+            // Collapse Visual selection to the cursor and clear pending state.
+            if self.vim.mode.is_visual() {
+                let vc = self.vim.vcursor;
+                self.vim_set_cursor(ctx, editor_id, vc);
+            }
+            self.vim.reset_to_normal();
+        } else {
+            for c in typed {
+                self.vim_key(c, ctx, editor_id, now);
+            }
         }
 
-        // Starve the TextEdit of key/text input so Normal-mode keys never insert.
         ctx.input_mut(|i| i.events.retain(|e|
             !matches!(e, egui::Event::Text(_) | egui::Event::Key { .. })));
     }
 
-    fn vim_normal_char(&mut self, c: char, ctx: &egui::Context, editor_id: egui::Id, now: f64) {
-        let text: Vec<char> = self.tabs[self.active_tab].content.chars().collect();
-        let i = self.vim_cursor_index(ctx, editor_id).min(text.len());
+    /// The main Normal/Visual keystroke dispatcher.
+    fn vim_key(&mut self, c: char, ctx: &egui::Context, editor_id: egui::Id, now: f64) {
+        let text = self.vim_chars();
+        let cursor = self.vim_cursor(ctx, editor_id, text.len());
 
-        // Second key of a `g` sequence.
+        // `r` awaiting its replacement character (count preserved).
+        if self.vim.pending_replace {
+            self.vim.pending_replace = false;
+            let n = self.vim.take_count();
+            if c != '\n' && cursor < text.len() && text[cursor] != '\n' {
+                let last = vim::line_last(&text, cursor);
+                let end = (cursor + n).min(last + 1);
+                let repl: String = std::iter::repeat(c).take(end - cursor).collect();
+                self.vim_delete_range(cursor, end, now);
+                self.vim_insert_text(cursor, &repl, now);
+                let text2 = self.vim_chars();
+                self.vim_set_cursor(ctx, editor_id, vim::clamp_normal(&text2, end.saturating_sub(1)));
+            }
+            return;
+        }
+
+        // `f`/`F`/`t`/`T` awaiting a target character.
+        if let Some(kind) = self.vim.pending_find.take() {
+            let n = self.vim.take_count();
+            if let Some(target) = vim::find_in_line(&text, cursor, kind, c, n) {
+                let mk = match kind {
+                    vim::FindKind::Forward | vim::FindKind::Till => vim::MotionKind::Inclusive,
+                    _ => vim::MotionKind::Exclusive,
+                };
+                self.vim_move_or_op(&text, cursor, target, mk, ctx, editor_id, now);
+            } else {
+                self.vim.pending_op = None;
+            }
+            return;
+        }
+
+        // Numeric count ('0' is a motion when no count is pending).
+        if c.is_ascii_digit() && !(c == '0' && self.vim.count.is_none()) {
+            let d = c as usize - '0' as usize;
+            self.vim.count = Some(self.vim.count.unwrap_or(0).saturating_mul(10).saturating_add(d));
+            return;
+        }
+
+        // `g` prefix (gg).
         if self.vim.pending_g {
             self.vim.pending_g = false;
+            self.vim.count = None;
             if c == 'g' {
-                let ni = vim::clamp_normal(&text, vim::buffer_top(&text));
-                self.vim_set_cursor(ctx, editor_id, ni);
-                self.vim.want_col = None;
+                let target = vim::buffer_top(&text);
+                self.vim_move_or_op(&text, cursor, target, vim::MotionKind::Linewise, ctx, editor_id, now);
             }
             return;
         }
 
-        // Pure cursor motions.
-        let motion: Option<usize> = match c {
-            'h' => Some(vim::left(&text, i)),
-            'l' => Some(vim::right(&text, i)),
-            '0' => Some(vim::line_start(&text, i)),
-            '^' => Some(vim::first_non_blank(&text, i)),
-            '$' => Some(vim::line_last(&text, i)),
-            'w' => Some(vim::clamp_normal(&text, vim::word_forward(&text, i))),
-            'b' => Some(vim::clamp_normal(&text, vim::word_backward(&text, i))),
-            'e' => Some(vim::clamp_normal(&text, vim::word_end(&text, i))),
-            'G' => Some(vim::clamp_normal(&text, vim::buffer_bottom(&text))),
-            'j' => {
-                let wc = self.vim.want_col.unwrap_or_else(|| vim::col(&text, i));
-                self.vim.want_col = Some(wc);
-                Some(vim::down(&text, i, wc))
-            }
-            'k' => {
-                let wc = self.vim.want_col.unwrap_or_else(|| vim::col(&text, i));
-                self.vim.want_col = Some(wc);
-                Some(vim::up(&text, i, wc))
-            }
+        // Any non-vertical key resets the desired column.
+        if !matches!(c, 'j' | 'k') {
+            self.vim.want_col = None;
+        }
+
+        // Operators d / c / y.
+        if let Some(op) = match c {
+            'd' => Some(vim::Op::Delete),
+            'c' => Some(vim::Op::Change),
+            'y' => Some(vim::Op::Yank),
             _ => None,
-        };
-        if let Some(ni) = motion {
-            if !matches!(c, 'j' | 'k') {
-                self.vim.want_col = None;
+        } {
+            if self.vim.mode.is_visual() {
+                self.vim_op_visual(op, ctx, editor_id, now);
+                return;
             }
-            self.vim_set_cursor(ctx, editor_id, ni);
+            match self.vim.pending_op {
+                Some(p) if p.op == op => {
+                    // Doubled operator (dd/cc/yy) → linewise over `count` lines.
+                    let lines = p.count.saturating_mul(self.vim.take_count());
+                    self.vim.pending_op = None;
+                    self.vim_op_lines(op, lines, cursor, ctx, editor_id, now);
+                }
+                _ => {
+                    let n = self.vim.take_count();
+                    self.vim.pending_op = Some(vim::PendingOp { op, count: n });
+                }
+            }
             return;
         }
 
-        match c {
-            'g' => self.vim.pending_g = true,
-            'u' => self.do_undo(ctx),
+        // `f`/`F`/`t`/`T` prefixes.
+        if let Some(k) = match c {
+            'f' => Some(vim::FindKind::Forward),
+            'F' => Some(vim::FindKind::Back),
+            't' => Some(vim::FindKind::Till),
+            'T' => Some(vim::FindKind::TillBack),
+            _ => None,
+        } {
+            self.vim.pending_find = Some(k);
+            return;
+        }
 
-            // Enter Insert mode.
+        // `j` / `k` — vertical motions with column memory.
+        if c == 'j' || c == 'k' {
+            let mc = self.vim.count.unwrap_or(1).max(1);
+            let total = self.vim.pending_op.map_or(mc, |p| p.count.saturating_mul(mc));
+            self.vim.count = None;
+            let wc = self.vim.want_col.unwrap_or_else(|| vim::col(&text, cursor));
+            self.vim.want_col = Some(wc);
+            let mut t = cursor;
+            for _ in 0..total {
+                t = if c == 'j' { vim::down(&text, t, wc) } else { vim::up(&text, t, wc) };
+            }
+            self.vim_move_or_op(&text, cursor, t, vim::MotionKind::Linewise, ctx, editor_id, now);
+            return;
+        }
+
+        // Other counted motions (h l w b e 0 ^ $ { } G).
+        let mc = self.vim.count.unwrap_or(1).max(1);
+        let total = self.vim.pending_op.map_or(mc, |p| p.count.saturating_mul(mc));
+        if let Some((target, kind)) = self.vim_resolve_motion(c, &text, cursor, total) {
+            self.vim.count = None;
+            self.vim_move_or_op(&text, cursor, target, kind, ctx, editor_id, now);
+            return;
+        }
+
+        // A pending operator followed by a non-motion cancels the operator.
+        if self.vim.pending_op.is_some() {
+            self.vim.pending_op = None;
+            self.vim.count = None;
+            return;
+        }
+
+        // In Visual mode, `x`/`s` act on the selection like `d`/`c`.
+        if self.vim.mode.is_visual() {
+            match c {
+                'x' => { self.vim_op_visual(vim::Op::Delete, ctx, editor_id, now); return; }
+                's' => { self.vim_op_visual(vim::Op::Change, ctx, editor_id, now); return; }
+                _ => {}
+            }
+        }
+
+        // Standalone commands.
+        match c {
+            'v' => self.vim_toggle_visual(Mode::Visual, cursor),
+            'V' => self.vim_toggle_visual(Mode::VisualLine, cursor),
             'i' => self.vim.mode = Mode::Insert,
             'a' => {
-                let ni = (i + 1).min(vim::line_end(&text, i));
+                let ni = (cursor + 1).min(vim::line_end(&text, cursor));
                 self.vim_set_cursor(ctx, editor_id, ni);
                 self.vim.mode = Mode::Insert;
             }
             'I' => {
-                let ni = vim::first_non_blank(&text, i);
+                let ni = vim::first_non_blank(&text, cursor);
                 self.vim_set_cursor(ctx, editor_id, ni);
                 self.vim.mode = Mode::Insert;
             }
             'A' => {
-                let ni = vim::line_end(&text, i);
+                let ni = vim::line_end(&text, cursor);
                 self.vim_set_cursor(ctx, editor_id, ni);
                 self.vim.mode = Mode::Insert;
             }
-
-            // Editing commands (each a single undo step).
-            'x' => {
-                let last = vim::line_last(&text, i);
-                if i < text.len() && text[i] != '\n' {
-                    let id = self.tabs[self.active_tab].id;
-                    self.push_undo_snap(id, self.tabs[self.active_tab].content.clone());
-                    let content = &mut self.tabs[self.active_tab].content;
-                    let ba = char_to_byte(content, i);
-                    let bb = char_to_byte(content, i + 1);
-                    content.replace_range(ba..bb, "");
-                    self.push_undo_snap(id, self.tabs[self.active_tab].content.clone());
-                    self.dirty = true;
-                    self.last_edit_time = now;
-                    let text2: Vec<char> = self.tabs[self.active_tab].content.chars().collect();
-                    self.vim_set_cursor(ctx, editor_id, vim::clamp_normal(&text2, i.min(last)));
-                }
-            }
             'o' => self.vim_open_line(ctx, editor_id, now, true),
             'O' => self.vim_open_line(ctx, editor_id, now, false),
-            _ => {}
+            'x' => {
+                let n = self.vim.take_count();
+                self.vim_delete_chars(cursor, n, false, ctx, editor_id, now);
+            }
+            'X' => {
+                let n = self.vim.take_count();
+                self.vim_delete_chars(cursor, n, true, ctx, editor_id, now);
+            }
+            's' => {
+                let n = self.vim.take_count();
+                self.vim_delete_chars(cursor, n, false, ctx, editor_id, now);
+                self.vim.mode = Mode::Insert;
+            }
+            'D' => {
+                let end = vim::line_end(&text, cursor);
+                self.vim_yank(&text, cursor, end, false);
+                self.vim_delete_range(cursor, end, now);
+                let t2 = self.vim_chars();
+                self.vim_set_cursor(ctx, editor_id, vim::clamp_normal(&t2, cursor));
+                self.vim.count = None;
+            }
+            'C' => {
+                let end = vim::line_end(&text, cursor);
+                self.vim_yank(&text, cursor, end, false);
+                self.vim_delete_range(cursor, end, now);
+                self.vim_set_cursor(ctx, editor_id, cursor);
+                self.vim.mode = Mode::Insert;
+                self.vim.count = None;
+            }
+            'S' => {
+                let n = self.vim.take_count();
+                self.vim_op_lines(vim::Op::Change, n, cursor, ctx, editor_id, now);
+            }
+            'r' => self.vim.pending_replace = true,
+            'p' => {
+                let n = self.vim.take_count();
+                self.vim_paste(true, n, ctx, editor_id, now);
+            }
+            'P' => {
+                let n = self.vim.take_count();
+                self.vim_paste(false, n, ctx, editor_id, now);
+            }
+            'u' => {
+                let n = self.vim.take_count();
+                for _ in 0..n { self.do_undo(ctx); }
+            }
+            _ => self.vim.count = None,
         }
+    }
+
+    fn vim_resolve_motion(&self, c: char, s: &[char], cursor: usize, count: usize)
+        -> Option<(usize, vim::MotionKind)>
+    {
+        let mut i = cursor;
+        let r = match c {
+            'h' => { for _ in 0..count { i = vim::left(s, i); }        (i, vim::MotionKind::Exclusive) }
+            'l' => { for _ in 0..count { i = vim::right(s, i); }       (i, vim::MotionKind::Exclusive) }
+            'w' => { for _ in 0..count { i = vim::word_forward(s, i); }(i, vim::MotionKind::Exclusive) }
+            'b' => { for _ in 0..count { i = vim::word_backward(s, i);}(i, vim::MotionKind::Exclusive) }
+            'e' => { for _ in 0..count { i = vim::word_end(s, i); }    (i, vim::MotionKind::Inclusive) }
+            '{' => { for _ in 0..count { i = vim::paragraph_backward(s, i); } (i, vim::MotionKind::Exclusive) }
+            '}' => { for _ in 0..count { i = vim::paragraph_forward(s, i); }  (i, vim::MotionKind::Exclusive) }
+            '0' => (vim::line_start(s, i), vim::MotionKind::Exclusive),
+            '^' => (vim::first_non_blank(s, i), vim::MotionKind::Exclusive),
+            '$' => {
+                for _ in 0..count.saturating_sub(1) { i = vim::down(s, i, usize::MAX); }
+                (vim::line_last(s, i), vim::MotionKind::Inclusive)
+            }
+            'G' => (vim::buffer_bottom(s), vim::MotionKind::Linewise),
+            _ => return None,
+        };
+        Some(r)
+    }
+
+    /// Apply a pending operator over the motion, extend the Visual selection, or
+    /// move the Normal-mode cursor.
+    fn vim_move_or_op(&mut self, text: &[char], from: usize, target: usize,
+        kind: vim::MotionKind, ctx: &egui::Context, editor_id: egui::Id, now: f64)
+    {
+        if let Some(p) = self.vim.pending_op.take() {
+            self.vim_apply_operator(p.op, from, target, kind, text, ctx, editor_id, now);
+        } else if self.vim.mode.is_visual() {
+            self.vim.vcursor = vim::clamp_normal(text, target);
+        } else {
+            self.vim_set_cursor(ctx, editor_id, vim::clamp_normal(text, target));
+        }
+    }
+
+    fn vim_yank(&mut self, text: &[char], start: usize, end: usize, linewise: bool) {
+        if end > start {
+            self.vim.register = text[start..end].iter().collect();
+            self.vim.register_linewise = linewise;
+        }
+    }
+
+    fn vim_apply_operator(&mut self, op: vim::Op, from: usize, target: usize,
+        kind: vim::MotionKind, text: &[char], ctx: &egui::Context, editor_id: egui::Id, now: f64)
+    {
+        // Change over a linewise motion keeps an empty line (Vim `cc`/`cj`).
+        if op == vim::Op::Change && kind == vim::MotionKind::Linewise {
+            let (a, b) = (from.min(target), from.max(target));
+            let start = vim::line_start(text, a);
+            let end = vim::line_end(text, b);
+            self.vim_yank(text, start, end, true);
+            self.vim_delete_range(start, end, now);
+            self.vim_set_cursor(ctx, editor_id, start);
+            self.vim.mode = Mode::Insert;
+            return;
+        }
+
+        let (start, end, linewise) = vim::op_range(text, from, target, kind);
+        if end <= start {
+            return;
+        }
+        self.vim_yank(text, start, end, linewise);
+        match op {
+            vim::Op::Yank => {
+                self.vim_set_cursor(ctx, editor_id, vim::clamp_normal(text, start));
+            }
+            vim::Op::Delete => {
+                self.vim_delete_range(start, end, now);
+                let t2 = self.vim_chars();
+                self.vim_set_cursor(ctx, editor_id, vim::clamp_normal(&t2, start));
+            }
+            vim::Op::Change => {
+                self.vim_delete_range(start, end, now);
+                self.vim_set_cursor(ctx, editor_id, start);
+                self.vim.mode = Mode::Insert;
+            }
+        }
+    }
+
+    /// Linewise operator over `lines` lines from the cursor (dd/yy/cc/S).
+    fn vim_op_lines(&mut self, op: vim::Op, lines: usize, cursor: usize,
+        ctx: &egui::Context, editor_id: egui::Id, now: f64)
+    {
+        let text = self.vim_chars();
+        let lines = lines.max(1);
+        // Target = start of the (lines-1)-th line below the cursor line.
+        let mut end_line_pos = cursor;
+        for _ in 0..lines.saturating_sub(1) {
+            end_line_pos = vim::down(&text, end_line_pos, 0);
+        }
+        self.vim_apply_operator(op, cursor, end_line_pos, vim::MotionKind::Linewise, &text, ctx, editor_id, now);
+    }
+
+    /// `x` (forward) / `X` (backward): delete up to `n` chars on the line.
+    fn vim_delete_chars(&mut self, cursor: usize, n: usize, before: bool,
+        ctx: &egui::Context, editor_id: egui::Id, now: f64)
+    {
+        let text = self.vim_chars();
+        let (start, end) = if before {
+            let ls = vim::line_start(&text, cursor);
+            (cursor.saturating_sub(n).max(ls), cursor)
+        } else {
+            if cursor >= text.len() || text[cursor] == '\n' { return; }
+            let last = vim::line_last(&text, cursor);
+            (cursor, (cursor + n).min(last + 1))
+        };
+        if end <= start { return; }
+        self.vim_yank(&text, start, end, false);
+        self.vim_delete_range(start, end, now);
+        let t2 = self.vim_chars();
+        self.vim_set_cursor(ctx, editor_id, vim::clamp_normal(&t2, start));
+    }
+
+    fn vim_toggle_visual(&mut self, target: Mode, cursor: usize) {
+        if self.vim.mode == target {
+            self.vim.reset_to_normal();
+        } else {
+            self.vim.mode = target;
+            self.vim.visual_anchor = cursor;
+            self.vim.vcursor = cursor;
+        }
+    }
+
+    /// Apply an operator to the current Visual selection, then return to Normal.
+    fn vim_op_visual(&mut self, op: vim::Op, ctx: &egui::Context, editor_id: egui::Id, now: f64) {
+        let text = self.vim_chars();
+        let a = self.vim.visual_anchor.min(self.vim.vcursor);
+        let b = self.vim.visual_anchor.max(self.vim.vcursor);
+        let linewise = self.vim.mode == Mode::VisualLine;
+        let (start, end, lw) = if linewise {
+            let s = vim::line_start(&text, a);
+            let nl = vim::line_end(&text, b);
+            let e = if nl < text.len() { nl + 1 } else { nl };
+            (s, e, true)
+        } else {
+            (a, (b + 1).min(text.len()), false)
+        };
+        self.vim_yank(&text, start, end, lw);
+        match op {
+            vim::Op::Yank => {
+                self.vim_set_cursor(ctx, editor_id, vim::clamp_normal(&text, start));
+                self.vim.reset_to_normal();
+            }
+            vim::Op::Delete => {
+                self.vim_delete_range(start, end, now);
+                let t2 = self.vim_chars();
+                self.vim_set_cursor(ctx, editor_id, vim::clamp_normal(&t2, start));
+                self.vim.reset_to_normal();
+            }
+            vim::Op::Change => {
+                // For linewise change keep an empty line.
+                if linewise {
+                    let s = vim::line_start(&text, a);
+                    let e = vim::line_end(&text, b);
+                    self.vim_delete_range(s, e, now);
+                    self.vim_set_cursor(ctx, editor_id, s);
+                } else {
+                    self.vim_delete_range(start, end, now);
+                    self.vim_set_cursor(ctx, editor_id, start);
+                }
+                self.vim.reset_to_normal();
+                self.vim.mode = Mode::Insert;
+            }
+        }
+    }
+
+    /// Paste the register `n` times, after (`p`) or before (`P`) the cursor.
+    fn vim_paste(&mut self, after: bool, n: usize, ctx: &egui::Context, editor_id: egui::Id, now: f64) {
+        if self.vim.register.is_empty() { return; }
+        let text = self.vim_chars();
+        let cursor = self.vim_cursor(ctx, editor_id, text.len());
+        let mut block = self.vim.register.repeat(n);
+
+        if self.vim.register_linewise {
+            if !block.ends_with('\n') { block.push('\n'); }
+            let (at, cursor_line_start) = if after {
+                let nl = vim::line_end(&text, cursor);
+                if nl < text.len() {
+                    (nl + 1, nl + 1)
+                } else {
+                    // Last line without trailing newline: prepend a newline.
+                    block = format!("\n{}", block.trim_end_matches('\n'));
+                    (text.len(), text.len() + 1)
+                }
+            } else {
+                let ls = vim::line_start(&text, cursor);
+                (ls, ls)
+            };
+            self.vim_insert_text(at, &block, now);
+            let t2 = self.vim_chars();
+            self.vim_set_cursor(ctx, editor_id, vim::first_non_blank(&t2, cursor_line_start.min(t2.len())));
+        } else {
+            let at = if after { (cursor + 1).min(vim::line_end(&text, cursor)) } else { cursor };
+            let count = block.chars().count();
+            self.vim_insert_text(at, &block, now);
+            let t2 = self.vim_chars();
+            self.vim_set_cursor(ctx, editor_id, vim::clamp_normal(&t2, at + count.saturating_sub(1)));
+        }
+    }
+
+    /// Push the current Visual range into the egui selection so it is highlighted.
+    fn vim_sync_visual_selection(&self, ctx: &egui::Context, editor_id: egui::Id) {
+        let text = self.vim_chars();
+        let a = self.vim.visual_anchor.min(self.vim.vcursor);
+        let b = self.vim.visual_anchor.max(self.vim.vcursor);
+        let (lo, hi) = if self.vim.mode == Mode::VisualLine {
+            let s = vim::line_start(&text, a);
+            let nl = vim::line_end(&text, b);
+            (s, if nl < text.len() { nl + 1 } else { nl })
+        } else {
+            (a, (b + 1).min(text.len()))
+        };
+        self.editor_set_cursor(ctx, editor_id, egui::text::CCursorRange::two(
+            egui::text::CCursor::new(lo),
+            egui::text::CCursor::new(hi),
+        ));
     }
 
     /// `o` / `O`: open a new line below/above and enter Insert mode.
     fn vim_open_line(&mut self, ctx: &egui::Context, editor_id: egui::Id, now: f64, below: bool) {
-        let text: Vec<char> = self.tabs[self.active_tab].content.chars().collect();
+        let text = self.vim_chars();
         let i = self.vim_cursor_index(ctx, editor_id).min(text.len());
         let insert_at = if below { vim::line_end(&text, i) } else { vim::line_start(&text, i) };
-
-        let id = self.tabs[self.active_tab].id;
-        self.push_undo_snap(id, self.tabs[self.active_tab].content.clone());
-        let content = &mut self.tabs[self.active_tab].content;
-        let byte = char_to_byte(content, insert_at);
-        content.insert(byte, '\n');
-        self.dirty = true;
-        self.last_edit_time = now;
-
+        self.vim_insert_text(insert_at, "\n", now);
         let cursor = if below { insert_at + 1 } else { insert_at };
         self.vim_set_cursor(ctx, editor_id, cursor);
         self.vim.mode = Mode::Insert;
@@ -1679,6 +2060,7 @@ impl SecureNote {
                         let mc = match self.vim.mode {
                             Mode::Normal => Color32::from_rgb(124, 106, 247),
                             Mode::Insert => Color32::from_rgb(92, 224, 138),
+                            Mode::Visual | Mode::VisualLine => Color32::from_rgb(224, 170, 60),
                         };
                         ui.label(RichText::new(self.vim.mode.label())
                             .size(11.0).strong().monospace().color(mc));
@@ -1947,6 +2329,8 @@ impl SecureNote {
             self.vim_step(ctx, editor_id, now);
         }
         let vim_normal_active = vim_engaged && self.vim.mode == Mode::Normal;
+        // Vim owns the cursor/selection in Normal and Visual modes.
+        let vim_owns_selection = vim_engaged && self.vim.mode != Mode::Insert;
 
         let font_size   = self.prefs.font_size;
         let word_wrap   = self.prefs.word_wrap;
@@ -2016,9 +2400,9 @@ impl SecureNote {
                 // other than that right-press. On the right-press we also restore the
                 // visual highlight that egui just cleared.
                 //
-                // In Vim Normal mode, Vim owns the selection/cursor, so this tracker
-                // is bypassed to avoid the two systems fighting.
-                if vim_normal_active {
+                // In Vim Normal/Visual modes, Vim owns the selection/cursor, so this
+                // tracker is bypassed to avoid the two systems fighting.
+                if vim_owns_selection {
                     self.context_sel = None;
                 } else {
                     let cur_sel = output.cursor_range.as_ref()
