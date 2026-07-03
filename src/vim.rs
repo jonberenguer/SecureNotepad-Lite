@@ -63,6 +63,24 @@ pub enum MotionKind {
     Linewise,
 }
 
+/// Which command line is open (Vim `/`, `?`, or `:`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CmdKind {
+    SearchFwd,
+    SearchBack,
+    Ex,
+}
+
+impl CmdKind {
+    pub fn prefix(self) -> &'static str {
+        match self {
+            CmdKind::SearchFwd => "/",
+            CmdKind::SearchBack => "?",
+            CmdKind::Ex => ":",
+        }
+    }
+}
+
 /// Persistent Vim state carried on the app.
 #[derive(Default)]
 pub struct Vim {
@@ -87,6 +105,16 @@ pub struct Vim {
     pub register: String,
     /// Whether the register holds whole lines (linewise).
     pub register_linewise: bool,
+    /// Open command line (`/`, `?`, `:`), if any.
+    pub cmdline: Option<CmdKind>,
+    /// Command-line input buffer.
+    pub cmd_buf: String,
+    /// Request focus for the command-line field next frame.
+    pub cmd_focus: bool,
+    /// Whether a `/` search highlight is currently active.
+    pub search_active: bool,
+    /// Direction of the last search (for `n`/`N`).
+    pub search_forward: bool,
 }
 
 impl Vim {

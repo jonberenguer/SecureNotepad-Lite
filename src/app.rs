@@ -391,6 +391,9 @@ impl SecureNote {
         self.apply_theme(ctx);
         // Start in Vim Normal mode with the editor focused so keys are captured.
         self.vim.reset_to_normal();
+        self.vim.cmdline = None;
+        self.vim.cmd_buf.clear();
+        self.vim.search_active = false;
         if self.prefs.vim_mode {
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("editor")));
         }
@@ -1124,8 +1127,212 @@ impl SecureNote {
                 let n = self.vim.take_count();
                 for _ in 0..n { self.do_undo(ctx); }
             }
+            '/' => self.vim_open_cmdline(vim::CmdKind::SearchFwd),
+            '?' => self.vim_open_cmdline(vim::CmdKind::SearchBack),
+            ':' => self.vim_open_cmdline(vim::CmdKind::Ex),
+            'n' => { let f = self.vim.search_forward; self.vim_search_jump(f, ctx, editor_id); }
+            'N' => { let f = self.vim.search_forward; self.vim_search_jump(!f, ctx, editor_id); }
             _ => self.vim.count = None,
         }
+    }
+
+    fn vim_open_cmdline(&mut self, kind: vim::CmdKind) {
+        self.vim.cmdline = Some(kind);
+        self.vim.cmd_buf.clear();
+        self.vim.cmd_focus = true;
+        if let vim::CmdKind::SearchFwd | vim::CmdKind::SearchBack = kind {
+            self.vim.search_forward = kind == vim::CmdKind::SearchFwd;
+        }
+    }
+
+    fn vim_close_cmdline(&mut self, ctx: &egui::Context) {
+        self.vim.cmdline = None;
+        self.vim.cmd_buf.clear();
+        self.vim.cmd_focus = false;
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("editor")));
+    }
+
+    /// Jump the editor cursor to the next/previous search match.
+    fn vim_search_jump(&mut self, forward: bool, ctx: &egui::Context, editor_id: egui::Id) {
+        if self.search_results.is_empty() {
+            self.toast("No matches", ctx);
+            return;
+        }
+        self.vim.search_active = true;
+        let content = &self.tabs[self.active_tab].content;
+        let cursor_char = self.vim_cursor_index(ctx, editor_id).min(content.chars().count());
+        let cursor_byte = char_to_byte(content, cursor_char);
+
+        let target = if forward {
+            self.search_results.iter().find(|(s, _)| *s > cursor_byte).copied()
+                .or_else(|| self.search_results.first().copied())
+        } else {
+            self.search_results.iter().rev().find(|(s, _)| *s < cursor_byte).copied()
+                .or_else(|| self.search_results.last().copied())
+        };
+
+        if let Some((sb, _)) = target {
+            if let Some(pos) = self.search_results.iter().position(|(s, _)| *s == sb) {
+                self.search_idx = pos;
+            }
+            let char_idx = content[..sb.min(content.len())].chars().count();
+            self.vim_set_cursor(ctx, editor_id, char_idx);
+        }
+    }
+
+    fn vim_execute_cmdline(&mut self, ctx: &egui::Context) {
+        let Some(kind) = self.vim.cmdline.take() else { return };
+        let buf = std::mem::take(&mut self.vim.cmd_buf);
+        self.vim.cmd_focus = false;
+        let editor_id = egui::Id::new("editor");
+
+        match kind {
+            vim::CmdKind::SearchFwd | vim::CmdKind::SearchBack => {
+                let forward = kind == vim::CmdKind::SearchFwd;
+                self.vim.search_forward = forward;
+                if !buf.is_empty() {
+                    self.search_query = buf;
+                    self.search_regex = true;
+                    self.run_search();
+                    if self.search_regex_error {
+                        self.toast("Invalid search pattern", ctx);
+                    } else {
+                        self.vim.search_active = true;
+                        self.vim_search_jump(forward, ctx, editor_id);
+                    }
+                }
+                ctx.memory_mut(|m| m.request_focus(editor_id));
+            }
+            vim::CmdKind::Ex => {
+                self.vim_ex(&buf, ctx);
+                // Only refocus the editor if we're still editing (":q" locks).
+                if self.screen == Screen::Editor {
+                    ctx.memory_mut(|m| m.request_focus(editor_id));
+                }
+            }
+        }
+    }
+
+    /// Execute an `:` ex command.
+    fn vim_ex(&mut self, cmd: &str, ctx: &egui::Context) {
+        let c = cmd.trim();
+        if c.is_empty() { return; }
+        match c {
+            "w" => self.save_now(ctx),
+            "wq" | "x" => { self.save_now(ctx); self.lock(); }
+            "q" => { self.save_now(ctx); self.lock(); }
+            "q!" => self.lock(),
+            "noh" | "nohl" | "nohlsearch" => self.vim.search_active = false,
+            _ => {
+                if let Ok(n) = c.parse::<usize>() {
+                    self.vim_goto_line(n, ctx);
+                } else if c.starts_with('s') || c.starts_with("%s") {
+                    self.vim_substitute(c, ctx);
+                } else {
+                    self.toast(format!("Not an editor command: {c}"), ctx);
+                }
+            }
+        }
+    }
+
+    fn vim_goto_line(&mut self, n: usize, ctx: &egui::Context) {
+        let text = self.vim_chars();
+        let mut idx = 0usize;
+        let mut line = 1usize;
+        while line < n.max(1) && idx < text.len() {
+            if text[idx] == '\n' { line += 1; }
+            idx += 1;
+        }
+        let target = vim::first_non_blank(&text, idx.min(text.len()));
+        self.vim_set_cursor(ctx, egui::Id::new("editor"), vim::clamp_normal(&text, target));
+    }
+
+    /// `:s/pat/rep/flags` (current line) or `:%s/pat/rep/flags` (whole file).
+    /// Replacement uses Rust regex syntax (`$1` for capture groups).
+    fn vim_substitute(&mut self, cmd: &str, ctx: &egui::Context) {
+        let whole = cmd.starts_with('%');
+        let body = if whole { &cmd[2..] } else { &cmd[1..] };
+        if !body.starts_with('/') {
+            self.toast("Usage: :s/pattern/replacement/[g]", ctx);
+            return;
+        }
+        let segs: Vec<&str> = body[1..].splitn(3, '/').collect();
+        let pat = segs.first().copied().unwrap_or("");
+        let rep = segs.get(1).copied().unwrap_or("");
+        let flags = segs.get(2).copied().unwrap_or("");
+        let global = flags.contains('g');
+        if pat.is_empty() { return; }
+
+        let re = match regex::Regex::new(pat) {
+            Ok(r) => r,
+            Err(_) => { self.toast("Invalid pattern", ctx); return; }
+        };
+
+        let content = self.tabs[self.active_tab].content.clone();
+        let cur_line = self.cursor_line;
+        let mut out: Vec<String> = Vec::new();
+        let mut hits = 0usize;
+        for (idx, line) in content.split('\n').enumerate() {
+            if whole || idx == cur_line {
+                let replaced = if global {
+                    re.replace_all(line, rep)
+                } else {
+                    re.replace(line, rep)
+                };
+                if replaced != line { hits += 1; }
+                out.push(replaced.into_owned());
+            } else {
+                out.push(line.to_string());
+            }
+        }
+        let new_content = out.join("\n");
+        if new_content != content {
+            let id = self.tabs[self.active_tab].id;
+            self.push_undo_snap(id, content);
+            self.tabs[self.active_tab].content = new_content;
+            self.push_undo_snap(id, self.tabs[self.active_tab].content.clone());
+            self.dirty = true;
+            self.last_edit_time = ctx.input(|i| i.time);
+        }
+        self.toast(format!("{hits} line(s) changed"), ctx);
+    }
+
+    /// Render the Vim command line (`/`, `?`, `:`) as a bottom panel.
+    fn ui_vim_cmdline(&mut self, ctx: &egui::Context) {
+        let Some(kind) = self.vim.cmdline else { return };
+        let bg     = if self.prefs.dark_mode { Color32::from_rgb(18,18,22)  } else { Color32::from_rgb(238,238,233) };
+        let border = if self.prefs.dark_mode { Color32::from_rgb(46,46,56)  } else { Color32::from_rgb(204,204,196) };
+
+        egui::TopBottomPanel::bottom("vim_cmdline")
+            .exact_height(26.0)
+            .frame(egui::Frame::none()
+                .fill(bg)
+                .stroke(Stroke::new(1.0, border))
+                .inner_margin(egui::Margin::symmetric(10.0, 2.0)))
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    ui.label(RichText::new(kind.prefix()).monospace().size(13.0)
+                        .color(Color32::from_rgb(124, 106, 247)));
+                    let resp = ui.add(egui::TextEdit::singleline(&mut self.vim.cmd_buf)
+                        .desired_width(f32::INFINITY)
+                        .font(FontId::monospace(13.0))
+                        .frame(false));
+                    if self.vim.cmd_focus {
+                        resp.request_focus();
+                        self.vim.cmd_focus = false;
+                    }
+                    let enter  = resp.lost_focus() && ctx.input(|i| i.key_pressed(EKey::Enter));
+                    let escape = ctx.input(|i| i.key_pressed(EKey::Escape));
+                    if enter {
+                        self.vim_execute_cmdline(ctx);
+                    } else if escape {
+                        self.vim_close_cmdline(ctx);
+                    } else {
+                        resp.request_focus();
+                    }
+                });
+            });
     }
 
     fn vim_resolve_motion(&self, c: char, s: &[char], cursor: usize, count: usize)
@@ -1585,6 +1792,7 @@ impl SecureNote {
         self.ui_tabbar(ctx);
         if self.search_open { self.ui_search_bar(ctx); }
         self.ui_statusbar(ctx);
+        if self.vim.cmdline.is_some() { self.ui_vim_cmdline(ctx); }
 
         // Markdown live-preview pane (hidden for locked tabs).
         let show_preview = self.prefs.preview_open
@@ -2461,7 +2669,7 @@ impl SecureNote {
                 // Draw search match highlights using the painter after the TextEdit renders.
                 // Semi-transparent rects are drawn over the text; the text remains readable
                 // through the highlight because of the alpha channel.
-                if self.search_open && !self.search_results.is_empty() {
+                if (self.search_open || self.vim.search_active) && !self.search_results.is_empty() {
                     let text    = &self.tabs[self.active_tab].content;
                     let painter = ui.painter();
 
