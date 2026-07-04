@@ -199,6 +199,8 @@ pub struct SecureNote {
     vim: Vim,
     // Active tab seen last frame, to reset Vim state when the tab changes.
     vim_prev_tab: usize,
+    // Last editor cursor index, to scroll the view when a Vim motion moves it.
+    vim_last_cursor: usize,
 
     // Per-tab undo/redo history keyed by tab.id
     undo_stacks:      HashMap<u32, Vec<String>>,
@@ -264,6 +266,7 @@ impl SecureNote {
             context_sel:        None,
             vim:                Vim::default(),
             vim_prev_tab:       0,
+            vim_last_cursor:    0,
             undo_stacks:        HashMap::new(),
             undo_positions:     HashMap::new(),
             undo_last_snap:     0.0,
@@ -1033,7 +1036,7 @@ impl SecureNote {
             return;
         }
 
-        // `g` prefix (gg / {count}gg).
+        // Second key of a `g` sequence (gg / {count}gg).
         if self.vim.pending_g {
             self.vim.pending_g = false;
             if c == 'g' {
@@ -1045,6 +1048,13 @@ impl SecureNote {
             } else {
                 self.vim.count = None;
             }
+            return;
+        }
+        // First `g`: start a `g_` sequence. Handled here (before the operator-cancel
+        // path) so it also composes with an operator, e.g. `dgg`.
+        if c == 'g' {
+            self.vim.pending_g = true;
+            self.vim.want_col = None;
             return;
         }
 
@@ -3029,6 +3039,25 @@ impl SecureNote {
                     self.cursor_col  = before.rfind('\n')
                         .map(|p| before[p + 1..].chars().count())
                         .unwrap_or_else(|| before.chars().count());
+
+                    // Vim moves the cursor via TextEditState, so egui doesn't
+                    // auto-scroll to it. When the cursor index changes, scroll the
+                    // editor just enough to keep the caret visible (covers hjkl off
+                    // screen, gg/G, search jumps, etc.). In Visual modes follow the
+                    // moving end of the selection.
+                    let scroll_idx = if self.vim.mode.is_visual() {
+                        self.vim.vcursor
+                    } else {
+                        char_idx
+                    };
+                    if self.prefs.vim_mode && scroll_idx != self.vim_last_cursor {
+                        self.vim_last_cursor = scroll_idx;
+                        let cc = output.galley.from_ccursor(
+                            egui::text::CCursor::new(scroll_idx));
+                        let rect = output.galley.pos_from_cursor(&cc)
+                            .translate(output.galley_pos.to_vec2());
+                        ui.scroll_to_rect(rect, None);
+                    }
                 }
 
                 // Draw search match highlights using the painter after the TextEdit renders.
